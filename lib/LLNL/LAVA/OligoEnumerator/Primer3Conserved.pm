@@ -211,7 +211,7 @@ sub getOligos
     # primer3 doesn't really like non-ATCGN's
     my $seqContent = $sequence->seq();
     $seqContent = uc($seqContent);  # Convertir en majuscules d'abord
-    $seqContent =~ s/[^ATCG]/N/g;  # Puis remplacer caractères non-ADN par N
+    $seqContent =~ s/[^ATCG\-]/N/g; # Conserver les gaps '-' pour le calcul d'entropie
     $sequence->seq($seqContent);
 
     my $id = $sequence->id();
@@ -250,9 +250,14 @@ sub getOligos
   my $sequenceIndex = 1;
   
   # Running primer3 on the first sequence
+  # Primer3 ne tolère pas les gaps (-), on les remplace par N uniquement pour lui
   my $firstSequence = $alignment->get_seq_by_pos(1); # 1-indexed!
+  my $firstSeqContent = $firstSequence->seq();
+  $firstSeqContent =~ s/\-/N/g;
+  my $p3Seq = Bio::Seq->new(-id => $firstSequence->id(), -seq => $firstSeqContent);
+
   my $primer3 = Bio::Tools::Run::Primer3->new(
-    -seq => $firstSequence,
+    -seq => $p3Seq,
     -path => $this->{"d_primer3Executable"});
   my $p3Targets_r = $this->{"d_primer3Targets"};
 #  foreach my $targetName (keys(%{$primer3->arguments()}))

@@ -862,3 +862,13 @@ Identique au LOOP : la réduction prématurée par chevauchement sur les amorces
 
 **Impact attendu** :
 Le script STEM affiche désormais la section "Building Master Primer Lists (The Big Merge)..." avec les comptages par type, puis procède directement à la combinaison exhaustive Forward/Reverse en une seule passe, avant la réduction finale par chevauchement sur les signatures complètes.
+
+### [2026-05-22] Correction Critique : Calcul d'Entropie "Gap-Aware" (Fix)
+**Fichiers impactés** : `lib/LLNL/LAVA/OligoEnumerator/Primer3Conserved.pm`
+**Nature du changement** : [Algorithmique / Correction Bug Critique]
+
+**Problème identifié** :
+Le nettoyage initial des séquences avant le calcul d'entropie remplaçait tout ce qui n'était pas ATCG par un `N`. Cela détruisait les gaps (`-`), empêchant le calcul de Shannon de les détecter et de les pénaliser. Des régions avec 99% de gaps étaient faussement considérées comme parfaites.
+
+**Solution technique** :
+Modification du regex de nettoyage (`s/[^ATCG\-]/N/g`) pour préserver les gaps pendant le calcul d'entropie. Les gaps sont ensuite remplacés par `N` *uniquement* dans la séquence clone envoyée à Primer3, afin d'éviter qu'il ne plante tout en conservant les bonnes coordonnées spatiales.
