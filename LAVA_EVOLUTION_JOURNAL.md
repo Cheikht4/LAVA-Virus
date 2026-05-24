@@ -872,3 +872,15 @@ Le nettoyage initial des séquences avant le calcul d'entropie remplaçait tout 
 
 **Solution technique** :
 Modification du regex de nettoyage (`s/[^ATCG\-]/N/g`) pour préserver les gaps pendant le calcul d'entropie. Les gaps sont ensuite remplacés par `N` *uniquement* dans la séquence clone envoyée à Primer3, afin d'éviter qu'il ne plante tout en conservant les bonnes coordonnées spatiales.
+
+### [2026-05-24] Correction Ordre de Tri des Signatures Individuelles
+**Fichiers impactés** : `lava_loop_primer.pl`, `lava_stem_primer.pl`
+**Nature du changement** : [Bug Fix / Reporting]
+
+**Problème identifié** :
+L'ordre des signatures dans le dossier `*_signatures_individuelles` ne correspondait pas à l'ordre des signatures dans le fichier `.primers` principal. Les signatures individuelles et les fichiers `.fasta` des séquences amplifiées étaient générés à partir d'un tableau de mémoire non trié.
+
+**Solution technique** :
+Après l'opération de tri (Coverage > Degeneracy > Penalty), la référence globale `$possibleSignatures_r` est désormais réassignée pour pointer vers le nouveau tableau trié. Les fonctions d'écriture en aval (`createPerSignatureFiles`, `createAmplificationFiles`) utiliseront donc la bonne liste ordonnée.
+**Impact attendu** :
+Cohérence totale des rapports de bout en bout. La `signature_01_...` dans le dossier individuel correspond exactement à la Signature 1 du fichier `.primers`.

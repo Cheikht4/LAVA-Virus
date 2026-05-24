@@ -1972,6 +1972,9 @@ sub getOligosWithMismatchTolerance {
     }
     @{$possibleSignatures_r};
 
+  # Remplacer la référence globale par la nouvelle liste triée / Replace global reference with sorted list
+  $possibleSignatures_r = \@possibleSignatures;
+
   # Analyser les combinaisons de signatures (SUR LES SIGNATURES RÉDUITES ET VALIDÉES)
   if (scalar(@possibleSignatures) > 0) {
     my $num_signatures = scalar(@possibleSignatures);
