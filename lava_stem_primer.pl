@@ -903,17 +903,27 @@ sub getOligosWithMismatchTolerance {
   my @stemForwardPrimers = ();
   
   if($includeStemPrimers == $TRUE) {
-    print "Enumerating STEM \"back\" primers\n";
+    # BSTEM : genere nativement sur le brin + (Back Stem = sens du brin +)
+    # BSTEM: natively generated on plus strand (Back Stem = sense of plus strand)
+    print "Enumerating STEM BACK (BSTEM) primers on plus strand\n";
     @stemBackPrimers = getOligosWithMismatchTolerance($stemEnumerator, $inputMSA,
                                                         $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
                                                         $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
 
     print "  Generated \"" .
       scalar(@stemBackPrimers) .
-      "\" STEM \"back\" primers (avec tolérance mismatches)\n";
+      "\" STEM BACK (BSTEM) primers\n";
 
-    print "Building STEM \"forward\" primers from STEM \"back\" primers\n";
-    @stemForwardPrimers = buildReversePrimers(\@stemBackPrimers);
+    # FSTEM : Option B - genere nativement sur RC(MSA) pour garantir la protection 3'
+    # FSTEM: Option B - natively generated on RC(MSA) to guarantee 3-prime protection
+    print "Enumerating STEM FORWARD (FSTEM) NATIVE reverse primers (Option B)\n";
+    @stemForwardPrimers = buildNativeReversePool(
+      $stemEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp
+    );
+    print "  Generated \"" . scalar(@stemForwardPrimers) . "\" STEM FORWARD (FSTEM) native primers\n";
   } else {
     print "STEM primers désactivés - génération ignorée\n";
   }

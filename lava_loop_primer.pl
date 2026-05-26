@@ -895,17 +895,28 @@ sub getOligosWithMismatchTolerance {
   my @loopForwardPrimers = ();
   
   if($includeLoopPrimers == $TRUE) {
-  print "Enumerating loop \"back\" primers\n";
+  # BLOOP : genere nativement sur le brin + (Back Loop = sens du brin +, 3' pointe vers B1c)
+  # BLOOP: natively generated on plus strand (Back Loop = sense of plus strand, 3' points toward B1c)
+  print "Enumerating loop BACK (BLOOP) primers on plus strand\n";
     @loopBackPrimers = getOligosWithMismatchTolerance($loopEnumerator, $inputMSA,
                                                         $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
                                                         $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
 
   print "  Generated \"" .
     scalar(@loopBackPrimers) .
-    "\" loop \"back\" primers\n";
+    "\" loop BACK (BLOOP) primers\n";
 
-  print "Building loop \"forward\" primers from loop \"back\" primers\n";
-    @loopForwardPrimers = buildReversePrimers(\@loopBackPrimers);
+  # FLOOP : Option B - genere nativement sur RC(MSA) pour garantir la protection 3'
+  # FLOOP: Option B - natively generated on RC(MSA) to guarantee 3-prime protection
+  # (Forward Loop = antisens, 3' pointe vers F1c - correspondait avant au 5' du BLOOP source = bug)
+  print "Enumerating loop FORWARD (FLOOP) NATIVE reverse primers (Option B)\n";
+    @loopForwardPrimers = buildNativeReversePool(
+      $loopEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp
+    );
+  print "  Generated \"" . scalar(@loopForwardPrimers) . "\" loop FORWARD (FLOOP) native primers\n";
   } else {
     print "Loop primers désactivés - génération ignorée\n";
   }

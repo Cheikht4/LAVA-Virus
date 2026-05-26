@@ -924,3 +924,29 @@ thermodynamique 3' s'applique dans le référentiel correct pour TOUS les types 
 - Pool de candidats Reverse indépendant et plus riche (Primer3 optimise sur le bon brin)
 - Meilleures signatures LAMP car les 6 types d'amorces sont tous optimisés nativement
 - Couverture plus honnête et reproductible (la protection 3' est symétrique entre Forward et Reverse)
+
+### [2026-05-26] Complément Option B : FLOOP et FSTEM natifs
+
+**Fichiers impactés** : `lava_loop_primer.pl`, `lava_stem_primer.pl`
+**Nature du changement** : [Architecture / Bug Fix / Complément]
+
+**Problème identifié** :
+La correction Option B du commit précédent couvrait les amorces Outer/Middle/Inner Reverse,
+mais omettait deux autres amorces du brin moins générées par RC aveugle :
+- **FLOOP** (Forward Loop) : RC de BLOOP → IUPAC au 3' possible
+- **FSTEM** (Forward Stem) : RC de BSTEM → IUPAC au 3' possible
+
+**Solution technique** :
+Remplacement des appels `buildReversePrimers(\@loopBackPrimers)` et
+`buildReversePrimers(\@stemBackPrimers)` par `buildNativeReversePool()` avec les
+mêmes enumerateurs Loop/Stem et la même logique de validation sur RC(MSA).
+
+**Justification biologique** :
+FLOOP et FSTEM s'hybrident tous deux sur leurs cibles en 3'→5' (brin moins).
+La protection de leur extrémité 3' est tout aussi critique que pour B3/B2/B1c :
+elle détermine l'efficacité d'initiation de la synthèse isotherme dans la structure
+en haltère (dumbbell) caractéristique de l'amplification LAMP.
+
+**Impact attendu** :
+L'intégralité des 6 types d'amorces du brin moins (B3, B2, B1c, FLOOP, FSTEM et leurs
+équivalents Middle/Inner) sont désormais générés et validés nativement.
