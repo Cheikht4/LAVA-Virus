@@ -103,6 +103,14 @@ use LLNL::LAVA::PipelineUtils qw(buildReversePrimers buildNativeReversePool anal
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
 # Enable STDOUT autoflush for real-time log streaming via Flask
 $| = 1;
+# Autoflush STDERR pour que \r fonctionne en temps reel (comme tqdm)
+# Autoflush STDERR so \r works in real-time (like tqdm)
+use IO::Handle;
+STDERR->autoflush(1);
+# Detection du terminal interactif : barre en place si TTY, silencieuse si fichier
+# Detect interactive terminal: in-place bar if TTY, silent if redirected to file
+our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
+
 
 ################################################################################
 # FONCTIONS DE VALIDATION ET D'ANALYSE DES SIGNATURES
@@ -205,13 +213,17 @@ sub getOligosWithMismatchTolerance {
         $_pb_done++;
         if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
         elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          my $pct = int($_pb_done/$nb_fwd_candidates*100);
-          my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
-          my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                    ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
-                    : "";
-          printf(STDERR "\r  [%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
-                 $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+          if ($_LAVA_IS_TTY) {
+            my $pct = int($_pb_done/$nb_fwd_candidates*100);
+            my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
+            my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
+                      ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
+                      : " Done!";
+            # \r : retour debut de ligne sans newline = barre unique qui evolue (comme tqdm)
+            # \r : carriage return without newline = single evolving bar (like tqdm)
+            printf(STDERR "\r  [Fwd][%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
+                   $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+          }
         }
       } else {
         # Amorce stricte - garder la séquence originale / Strict primer - keep the original sequence
@@ -223,10 +235,15 @@ sub getOligosWithMismatchTolerance {
         $_pb_done++;
         if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
         elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          my $pct = int($_pb_done/$nb_fwd_candidates*100);
-          my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
-          printf(STDERR "\r  [%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d  ",
-                 $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count);
+          if ($_LAVA_IS_TTY) {
+            my $pct = int($_pb_done/$nb_fwd_candidates*100);
+            my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
+            my $eta = ($_pb_done < $nb_fwd_candidates)
+                      ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
+                      : " Done!";
+            printf(STDERR "\r  [Fwd][%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
+                   $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+          }
         }
       }
       
@@ -240,17 +257,25 @@ sub getOligosWithMismatchTolerance {
       $_pb_done++;
       if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
       elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-        my $pct = int($_pb_done/$nb_fwd_candidates*100);
-        my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
-        printf(STDERR "\r  [%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d  ",
-               $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count);
+        if ($_LAVA_IS_TTY) {
+          my $pct = int($_pb_done/$nb_fwd_candidates*100);
+          my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
+          my $eta = ($_pb_done < $nb_fwd_candidates)
+                    ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
+                    : " Done!";
+          printf(STDERR "\r  [Fwd][%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
+                 $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+        }
       }
     }
   }
   
   # Finaliser la barre / Finalize progress bar
   if ($_has_pb && $_pb_obj) { $_pb_obj->update($nb_fwd_candidates); }
-  else { print STDERR "\n"; }
+  elsif ($_LAVA_IS_TTY) {
+    # Effacer la barre et passer a la ligne suivante / Clear bar and move to next line
+    printf(STDERR "\r%-80s\n", "");
+  }
   print "RÉSULTATS tolérance mismatches:\n";
   print "  - Amorces strictes acceptées / accepted: $strict_count\n";
   print "  - Amorces dégénérées acceptées / accepted: $degenerate_count\n";

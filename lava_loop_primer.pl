@@ -95,6 +95,14 @@ use LLNL::LAVA::PipelineUtils qw(buildReversePrimers buildNativeReversePool anal
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
 # Enable STDOUT autoflush for real-time log streaming via Flask
 $| = 1;
+# Autoflush STDERR pour que \r fonctionne en temps reel (comme tqdm)
+# Autoflush STDERR so \r works in real-time (like tqdm)
+use IO::Handle;
+STDERR->autoflush(1);
+# Detection du terminal interactif : barre en place si TTY, silencieuse si fichier
+# Detect interactive terminal: in-place bar if TTY, silent if redirected to file
+our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
+
 
 ################################################################################
 # FONCTIONS DE VALIDATION ET D'ANALYSE DES SIGNATURES
@@ -189,13 +197,17 @@ sub getOligosWithMismatchTolerance {
         $_pb_done++;
         if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
         elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          my $pct = int($_pb_done/$nb_fwd_candidates*100);
-          my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
-          my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                    ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
-                    : "";
-          printf(STDERR "\r  [%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
-                 $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+          if ($_LAVA_IS_TTY) {
+            my $pct = int($_pb_done/$nb_fwd_candidates*100);
+            my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
+            my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
+                      ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
+                      : " Done!";
+            # \r : retour debut de ligne sans newline = barre unique qui evolue (comme tqdm)
+            # \r : carriage return without newline = single evolving bar (like tqdm)
+            printf(STDERR "\r  [Fwd][%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
+                   $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+          }
         }
       } else {
         $validatedPrimer->setTag("is_degenerate", 0);
@@ -206,10 +218,15 @@ sub getOligosWithMismatchTolerance {
         $_pb_done++;
         if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
         elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          my $pct = int($_pb_done/$nb_fwd_candidates*100);
-          my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
-          printf(STDERR "\r  [%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d  ",
-                 $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count);
+          if ($_LAVA_IS_TTY) {
+            my $pct = int($_pb_done/$nb_fwd_candidates*100);
+            my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
+            my $eta = ($_pb_done < $nb_fwd_candidates)
+                      ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
+                      : " Done!";
+            printf(STDERR "\r  [Fwd][%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
+                   $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+          }
         }
       }
       
@@ -222,17 +239,25 @@ sub getOligosWithMismatchTolerance {
       $_pb_done++;
       if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
       elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-        my $pct = int($_pb_done/$nb_fwd_candidates*100);
-        my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
-        printf(STDERR "\r  [%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d  ",
-               $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count);
+        if ($_LAVA_IS_TTY) {
+          my $pct = int($_pb_done/$nb_fwd_candidates*100);
+          my $bar = "#" x int($pct/5) . "-" x (20-int($pct/5));
+          my $eta = ($_pb_done < $nb_fwd_candidates)
+                    ? sprintf(" ETA:%ds", int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001))))
+                    : " Done!";
+          printf(STDERR "\r  [Fwd][%s] %d/%d (%d%%) | OK:%d DEG:%d REJ:%d%s  ",
+                 $bar,$_pb_done,$nb_fwd_candidates,$pct,$strict_count,$degenerate_count,$rejected_count,$eta);
+        }
       }
     }
   }
   
   # Finaliser la barre / Finalize progress bar
   if ($_has_pb && $_pb_obj) { $_pb_obj->update($nb_fwd_candidates); }
-  else { print STDERR "\n"; }
+  elsif ($_LAVA_IS_TTY) {
+    # Effacer la barre et passer a la ligne suivante / Clear bar and move to next line
+    printf(STDERR "\r%-80s\n", "");
+  }
   print "RÉSULTATS tolérance mismatches:\n";
   print "  - Amorces strictes acceptées / accepted: $strict_count\n";
   print "  - Amorces dégénérées acceptées / accepted: $degenerate_count\n";
@@ -1373,14 +1398,17 @@ sub getOligosWithMismatchTolerance {
       # Progress bar every 50 iterations or at 100%
       $_sig_fwd_done = $innerIndex + 1;
       if ($_sig_fwd_done % 50 == 0 || $_sig_fwd_done == $innerForwardCount) {
-        my $pct    = int($_sig_fwd_done / $innerForwardCount * 100);
-        my $bar    = "#" x int($pct/5) . "-" x (20 - int($pct/5));
-        my $elapsed = time() - $_sig_fwd_t0 + 0.001;
-        my $eta    = ($_sig_fwd_done < $innerForwardCount)
-                     ? sprintf(" ETA:%ds", int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed)))
-                     : " Done!";
-        printf(STDERR "\r  [Fwd Sig][%s] %d/%d (%d%%) | Sig trouv: %d%s  ",
-               $bar, $_sig_fwd_done, $innerForwardCount, $pct, $_sig_fwd_hits, $eta);
+        if ($_LAVA_IS_TTY) {
+          my $pct    = int($_sig_fwd_done / $innerForwardCount * 100);
+          my $bar    = "#" x int($pct/5) . "-" x (20 - int($pct/5));
+          my $elapsed = time() - $_sig_fwd_t0 + 0.001;
+          my $eta    = ($_sig_fwd_done < $innerForwardCount)
+                       ? sprintf(" ETA:%ds", int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed)))
+                       : " Done!";
+          # \r = barre unique qui evolue en place / \r = single bar evolving in place
+          printf(STDERR "\r  [Sig F][%s] %d/%d (%d%%) | Sig: %d%s  ",
+                 $bar, $_sig_fwd_done, $innerForwardCount, $pct, $_sig_fwd_hits, $eta);
+        }
       }
       my $innerInfo = $masterInnerF_r->[$innerIndex];
       my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerF_data_r->[$innerIndex]};
@@ -1551,7 +1579,7 @@ sub getOligosWithMismatchTolerance {
   } # End Inner
   
   # Finaliser la barre Forward / Finalize Forward bar
-  print STDERR "\n";
+  printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;  # Effacer et newline / Clear and newline
   print "  [Forward] $forwardSetCount combinaisons Forward trouvees sur $innerForwardCount amorces F1c.\n";
 
   # Check if anything found
@@ -1603,14 +1631,17 @@ sub getOligosWithMismatchTolerance {
       # Progress bar every 50 iterations or at 100%
       $_sig_rev_done = $innerIndex + 1;
       if ($_sig_rev_done % 50 == 0 || $_sig_rev_done == $innerReverseCount) {
-        my $pct    = int($_sig_rev_done / $innerReverseCount * 100);
-        my $bar    = "#" x int($pct/5) . "-" x (20 - int($pct/5));
-        my $elapsed = time() - $_sig_rev_t0 + 0.001;
-        my $eta    = ($_sig_rev_done < $innerReverseCount)
-                     ? sprintf(" ETA:%ds", int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed)))
-                     : " Done!";
-        printf(STDERR "\r  [Rev Sig][%s] %d/%d (%d%%) | Sig trouv: %d%s  ",
-               $bar, $_sig_rev_done, $innerReverseCount, $pct, $_sig_rev_hits, $eta);
+        if ($_LAVA_IS_TTY) {
+          my $pct    = int($_sig_rev_done / $innerReverseCount * 100);
+          my $bar    = "#" x int($pct/5) . "-" x (20 - int($pct/5));
+          my $elapsed = time() - $_sig_rev_t0 + 0.001;
+          my $eta    = ($_sig_rev_done < $innerReverseCount)
+                       ? sprintf(" ETA:%ds", int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed)))
+                       : " Done!";
+          # \r = barre unique qui evolue en place / \r = single bar evolving in place
+          printf(STDERR "\r  [Sig R][%s] %d/%d (%d%%) | Sig: %d%s  ",
+                 $bar, $_sig_rev_done, $innerReverseCount, $pct, $_sig_rev_hits, $eta);
+        }
       }
       my $innerInfo = $masterInnerR_r->[$innerIndex];
       my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerR_data_r->[$innerIndex]};
@@ -1779,7 +1810,7 @@ sub getOligosWithMismatchTolerance {
   } # End Inner
 
   # Finaliser la barre Reverse / Finalize Reverse bar
-  print STDERR "\n";
+  printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;  # Effacer et newline / Clear and newline
   print "  [Reverse] $reverseSetCount combinaisons Reverse trouvees sur $innerReverseCount amorces B1c.\n";
 
   if($reverseSetCount == 0) {

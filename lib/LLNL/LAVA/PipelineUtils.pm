@@ -45,6 +45,10 @@ use LLNL::LAVA::PrimerSet::PCRPair;
 use Bio::SeqIO;
 use POSIX qw(floor);
 use Time::HiRes qw(time);
+use IO::Handle;
+STDERR->autoflush(1);
+# Detection TTY pour barre en place (comme tqdm) / TTY detection for in-place bar (like tqdm)
+our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
 
 # Auto-detection de Term::ProgressBar (equivalent tqdm) / Auto-detect Term::ProgressBar (tqdm equivalent)
 # Si le module n'est pas installe, on utilise une barre ASCII maison sans dependance externe.
@@ -128,8 +132,11 @@ sub _update_progress {
     $extra_str = " | " . join(" ", @parts) if @parts;
   }
 
-  printf(STDERR "\r  [%s] %d/%d (%d%%)%s%s  ",
-         $bar_str, $done, $total, $pct, $extra_str, $eta_str);
+  # \r = barre unique en place si TTY, impression classique sinon / \r = in-place if TTY, classic print otherwise
+  if ($_LAVA_IS_TTY) {
+    printf(STDERR "\r  [%s] %d/%d (%d%%)%s%s  ",
+           $bar_str, $done, $total, $pct, $extra_str, $eta_str);
+  }
 }
 
 sub _finish_progress {
@@ -139,7 +146,8 @@ sub _finish_progress {
   } else {
     # Finaliser la ligne / Finalize the line
     _update_progress($bar_r, $bar_r->{total});
-    print STDERR "\n";
+    # Effacer la barre et passer a la ligne proprement / Clear bar and move to next line cleanly
+    printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;
   }
 }
 
