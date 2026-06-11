@@ -1410,14 +1410,26 @@ sub getOligosWithMismatchTolerance {
     my $forwardSetCount = 0;
 
     print "Scanning Forward Primer Combinations...\n";
-    my $fwd_progress_step = int($innerForwardCount / 10) || 1; # Mise a jour tous les 10%
+    # Barre de progression Flask pour les signatures Forward / Flask progress bar for Forward signatures
+    my $_sig_fwd_t0   = time();
+    my $_sig_fwd_done = 0;
+    my $_sig_fwd_hits = 0;  # Nombre de signatures Forward trouvees / Forward signatures found
+    print STDERR "  Recherche combinatoire Stem Forward: $innerForwardCount amorces F1c...\n";
 
     for(my $innerIndex = 0; $innerIndex < $innerForwardCount; $innerIndex++)
     {
-      # Afficher la progression tous les 10% / Print progress every 10%
-      if ($innerIndex % $fwd_progress_step == 0 || $innerIndex == $innerForwardCount - 1) {
-        my $pct = int(($innerIndex + 1) / $innerForwardCount * 100);
-        print "  [Forward] $pct% ($innerIndex/$innerForwardCount amorces internes traitees)\n";
+      # Emission LAVA-PROGRESS toutes les 50 iterations / Emit LAVA-PROGRESS every 50 iterations
+      $_sig_fwd_done = $innerIndex + 1;
+      if ($_sig_fwd_done % 50 == 0 || $_sig_fwd_done == $innerForwardCount) {
+        if ($_LAVA_IS_TTY || 1) {
+          my $elapsed = time() - $_sig_fwd_t0 + 0.001;
+          my $eta = ($_sig_fwd_done < $innerForwardCount)
+                    ? int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed))
+                    : 0;
+          my $rate = $_sig_fwd_done / $elapsed;
+          printf("[LAVA-PROGRESS] Signatures Stem Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
+                 $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
+        }
       }
       my $innerInfo = $innerForwardSubset_r->[$innerIndex];
       my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = 
@@ -1673,14 +1685,17 @@ sub getOligosWithMismatchTolerance {
               $bestForwardInfos[$innerIndex] = [$stemInfo, $middleInfo, $outerInfo];
               $bestSetPenalty = $forwardSetPenalty;
               $forwardSetCount++;
-              #print "*";             
-              # Not strictly necessary, but helpful for fine-tuning
+              $_sig_fwd_hits++;  # Compteur de signatures Fwd / Fwd signature counter
               $bestForwardPenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
             }
           } # End forward outer iteration
         } # End forward middle iteration
       } # End forward STEM iteration
     } # End forward inner iteration
+
+    # Finaliser la barre Forward / Finalize Forward bar
+    printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;
+    print "  [Stem Fwd] $forwardSetCount combinaisons Forward trouvees sur $innerForwardCount amorces F1c.\n";
 
     # Stop trying if no forward primer sets were found
     if($forwardSetCount == 0)
@@ -1702,14 +1717,26 @@ sub getOligosWithMismatchTolerance {
     ## To help short-cut when no possibilities are found
     #my $reverseSetCount = 0;
 
-    my $rev_progress_step = int($innerReverseCount / 10) || 1; # Mise a jour tous les 10%
+    # Barre de progression Flask pour les signatures Reverse / Flask progress bar for Reverse signatures
+    my $_sig_rev_t0   = time();
+    my $_sig_rev_done = 0;
+    my $_sig_rev_hits = 0;  # Nombre de signatures Reverse trouvees / Reverse signatures found
+    print STDERR "  Recherche combinatoire Stem Reverse: $innerReverseCount amorces B1c...\n";
 
     for(my $innerIndex = 0; $innerIndex < $innerReverseCount; $innerIndex++)
     {
-      # Afficher la progression tous les 10% / Print progress every 10%
-      if ($innerIndex % $rev_progress_step == 0 || $innerIndex == $innerReverseCount - 1) {
-        my $pct = int(($innerIndex + 1) / $innerReverseCount * 100);
-        print "  [Reverse] $pct% ($innerIndex/$innerReverseCount amorces internes traitees)\n";
+      # Emission LAVA-PROGRESS toutes les 50 iterations / Emit LAVA-PROGRESS every 50 iterations
+      $_sig_rev_done = $innerIndex + 1;
+      if ($_sig_rev_done % 50 == 0 || $_sig_rev_done == $innerReverseCount) {
+        if ($_LAVA_IS_TTY || 1) {
+          my $elapsed = time() - $_sig_rev_t0 + 0.001;
+          my $eta = ($_sig_rev_done < $innerReverseCount)
+                    ? int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed))
+                    : 0;
+          my $rate = $_sig_rev_done / $elapsed;
+          printf("[LAVA-PROGRESS] Signatures Stem Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
+                 $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
+        }
       }
       my $innerInfo = $innerReverseSubset_r->[$innerIndex];
       my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = 
@@ -1946,15 +1973,17 @@ sub getOligosWithMismatchTolerance {
             {
               $bestReverseInfos[$innerIndex] = [$stemInfo, $middleInfo, $outerInfo];
               $bestSetPenalty = $reverseSetPenalty;
-              #$reverseSetCount++;
-
-              # Not strictly necessary, but helpful for fine-tuning
+              $_sig_rev_hits++;  # Compteur de signatures Rev / Rev signature counter
               $bestReversePenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
             }
           } # End reverse outer iteration
         } # End reverse middle iteration
       } # End reverse STEM iteration
     } # End reverse inner iteration
+
+    # Finaliser la barre Reverse / Finalize Reverse bar
+    printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;
+    print "  [Stem Rev] $_sig_rev_hits combinaisons Reverse trouvees sur $innerReverseCount amorces B1c.\n";
 
     ## Stop trying if no reverse primer sets were found (probably an un-needed optimization)
     #if($reverseSetCount == 0)
