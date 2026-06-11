@@ -362,87 +362,112 @@ sub validateCompleteSignatureSpacing
 {
   my ($forwardPrimers_r, $reversePrimers_r, $minSpacing) = @_;
   
-  # print "\n🔍 VALIDATION COMPLÈTE D'ESPACEMENT ACTIVÉE\n";
-  
-  # Créer une liste ordonnée de tous les primers avec leurs positions / Create an ordered list of all primers with their positions
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Helper interne : récupère le strand depuis un PrimerInfo ou un Oligo
+  # Le strand est stocké sur l'Oligo (via setTag), PAS sur PrimerInfo directement.
+  # Internal helper: get strand from a PrimerInfo or Oligo object.
+  # The strand tag lives on the Oligo, NOT on PrimerInfo.
+  # ─────────────────────────────────────────────────────────────────────────────
+  my $get_strand = sub {
+    my ($primer, $default_strand) = @_;
+    # 1) Essayer via l'Oligo sous-jacent / Try via the underlying Oligo
+    if ($primer->can('getAnalyzedPrimer')) {
+      my $oligo = $primer->getAnalyzedPrimer();
+      if (defined $oligo && $oligo->can('getTagExists') && $oligo->getTagExists('strand')) {
+        return $oligo->getTag('strand');
+      }
+    }
+    # 2) Essayer directement si c'est déjà un Oligo / Try directly if it's an Oligo
+    if ($primer->can('getTagExists') && $primer->getTagExists('strand')) {
+      return $primer->getTag('strand');
+    }
+    # 3) Fallback sur le nom du primer (F→plus, B→minus) / Fallback on primer name
+    return $default_strand // 'plus';
+  };
+
+  # Créer une liste ordonnée de tous les primers avec leurs positions / Create ordered primer list
   my @allPrimers = ();
   
-  # Ajouter les primers forward (F3, F2, F1, FSTEM)
+  # Ajouter les primers forward (F3, F2, F1, FSTEM) — strand par défaut : plus
+  # Add forward primers (F3, F2, F1, FSTEM) — default strand: plus
   foreach my $primer (@{$forwardPrimers_r}) {
     next if (!defined $primer);
     my $location = $primer->getLocation();
-    my $length = $primer->getLength();
-    my $strand = $primer->getTag("strand");
+    my $length   = $primer->getLength();
+    my $strand   = $get_strand->($primer, 'plus');
     
     my ($start, $end);
-    # Calculer positions selon le strand réel / Calculate positions according to real strand
-    if($strand eq "plus") {
-      # Forward primer sur strand plus : location = position 5'
-      $start = $location;
-      $end = $location + $length - 1;
-    } else {
-      # Forward primer sur strand minus : location = position 3'
+    if ($strand eq 'minus') {
+      # Primer sur strand minus : location = position 3' (extrémité droite)
+      # Primer on minus strand: location = 3' end (rightmost position)
       $start = $location - $length + 1;
-      $end = $location;
+      $end   = $location;
+    } else {
+      # Primer sur strand plus : location = position 5' (extrémité gauche)
+      # Primer on plus strand: location = 5' end (leftmost position)
+      $start = $location;
+      $end   = $location + $length - 1;
     }
     
     push @allPrimers, {
-      'name' => $primer->{name} || 'Forward',
-      'start' => $start,
-      'end' => $end,
+      'name'   => $primer->{name} // 'Forward',
+      'start'  => $start,
+      'end'    => $end,
       'length' => $length,
-      'strand' => $strand
+      'strand' => $strand,
     };
   }
   
-  # Ajouter les primers reverse (BSTEM, B1, B2, B3)
+  # Ajouter les primers reverse (BSTEM, B1, B2, B3) — strand par défaut : minus
+  # Add reverse primers (BSTEM, B1, B2, B3) — default strand: minus
   foreach my $primer (@{$reversePrimers_r}) {
     next if (!defined $primer);
     my $location = $primer->getLocation();
-    my $length = $primer->getLength();
-    my $strand = $primer->getTag("strand");
+    my $length   = $primer->getLength();
+    my $strand   = $get_strand->($primer, 'minus');
     
     my ($start, $end);
-    # Calculer positions selon le strand réel / Calculate positions according to real strand
-    if($strand eq "minus") {
+    if ($strand eq 'minus') {
       # Reverse primer sur strand minus : location = position 3'
+      # Reverse primer on minus strand: location = 3' end
       $start = $location - $length + 1;
-      $end = $location;
+      $end   = $location;
     } else {
       # Reverse primer sur strand plus : location = position 5'
+      # Reverse primer on plus strand: location = 5' end
       $start = $location;
-      $end = $location + $length - 1;
+      $end   = $location + $length - 1;
     }
     
     push @allPrimers, {
-      'name' => $primer->{name} || 'Reverse',
-      'start' => $start,
-      'end' => $end,
+      'name'   => $primer->{name} // 'Reverse',
+      'start'  => $start,
+      'end'    => $end,
       'length' => $length,
-      'strand' => $strand
+      'strand' => $strand,
     };
   }
   
   # Trier par position de début / Sort by start position
-  @allPrimers = sort { $a->{start} <=> $b->{start} } @allPrimers;
+  @allPrimers = sort { $a->{'start'} <=> $b->{'start'} } @allPrimers;
   
   # Vérifier l'espacement entre primers consécutifs / Check spacing between consecutive primers
   for (my $i = 0; $i < @allPrimers - 1; $i++) {
     my $current = $allPrimers[$i];
-    my $next = $allPrimers[$i + 1];
+    my $next    = $allPrimers[$i + 1];
     
-    # Calculer l'espacement
-    my $spacing = $next->{start} - $current->{end} - 1;
+    # Espacement = nb de bases entre la fin du primer courant et le début du suivant
+    # Spacing = number of bases between end of current and start of next
+    my $spacing = $next->{'start'} - $current->{'end'} - 1;
     
-    # Vérifier s'il y a chevauchement (espacement négatif) / Check for overlap (negative spacing)
+    # Chevauchement = espacement négatif → signature invalide
+    # Overlap = negative spacing → invalid signature
     if ($spacing < 0) {
-      # print "  ❌ REJETÉ: CHEVAUCHEMENT détecté / REJECTED: OVERLAP detected ($spacing nt)\n";
-      return 0; # Échec de validation
+      return 0; # Échec de validation / Validation failed
     }
-    
   }
   
-  return 1; # Validation réussie
+  return 1; # Validation réussie / Validation passed
 }
 
 1;
