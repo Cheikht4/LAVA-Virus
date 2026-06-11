@@ -1447,14 +1447,14 @@ sub getOligosWithMismatchTolerance {
 	$searchStartAt = 0;
       }
 
-      # STEM ARCHITECTURE: STEM primers are placed AFTER inner forward primer
+      # STEM ARCHITECTURE: STEM primers are placed AFTER inner forward primer (F1c)
+      # et AVANT le B1c. La borne max = F1c_end + innerPairTargetLength/2
       # STEM Start At and End At are indexes where the STEM SEARCH starts and ends
+      # FSTEM must lie between F1c (innerLocation+innerLength) and the midpoint F1-B1
       my $stemStartAt = $innerLocation + $innerLength + $minPrimerSpacing;
-      my $stemEndAt = $innerLocation + $innerLength + $signatureMaxLength;
-      if($stemEndAt < 0)
-      {
-	$stemEndAt = 0;
-      }
+      my $stemEndAt   = $innerLocation + $innerLength + int($innerPairTargetLength / 2);
+      if($stemEndAt < $stemStartAt) { $stemEndAt = $stemStartAt + 50; }  # fallback
+      if($stemEndAt < 0) { $stemEndAt = 0; }
 
       # Progression : amorce inner suivante (debug retiré / debug removed)
       #print "(PA $sequenceLength long, start at $searchStartAt, maxLen $signatureMaxLength, $innerLocation->$stemStartAt-$stemEndAt)";
@@ -1755,14 +1755,13 @@ sub getOligosWithMismatchTolerance {
       my $searchEndAt = $innerLocation + $signatureMaxLength - 
 	$innerLength - 20; # -20 represents 2 other primer min lengths.
 	
-      # STEM ARCHITECTURE: STEM primers are positioned BEFORE inner reverse primer
-      # All the -1s are to deal with zero-indexing with counts that start at 1 
-      my $stemStartAt = $innerLocation - $innerLength - $signatureMaxLength;
-      my $stemEndAt = $innerLocation - $innerLength - $minPrimerSpacing;
-      if($stemStartAt < 0)
-      {
-	$stemStartAt = 0;
-      }
+      # STEM ARCHITECTURE: BSTEM primers are positioned BEFORE inner reverse primer (B1c)
+      # et APRES le F1c. La borne min = B1c_start - innerPairTargetLength/2
+      # BSTEM must lie between the midpoint F1-B1 and B1c
+      my $stemStartAt = $innerLocation - int($innerPairTargetLength / 2);
+      my $stemEndAt   = $innerLocation - $minPrimerSpacing;
+      if($stemStartAt < 0) { $stemStartAt = 0; }
+      if($stemStartAt > $stemEndAt) { $stemStartAt = ($stemEndAt > 50) ? $stemEndAt - 50 : 0; }  # fallback
 
       # If no STEM primers sought, then overwrite the STEM primer list with the
       # single placeholder, one-length (but ideally zero-length), zero-penalty
