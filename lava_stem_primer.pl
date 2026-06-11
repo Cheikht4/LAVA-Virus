@@ -774,8 +774,9 @@ sub getOligosWithMismatchTolerance {
     optionWithDefault($options_r, "stem_min_gap", 
       $optionDefaults{"stem_min_gap"});
   my $signatureCommonTargetMinPercent =
-    optionWithDefault($options_r, "min_signatures_for_success",
-      $optionDefaults{"min_signatures_for_success"});
+    optionWithDefault($options_r, "signature_common_target_min_percent",
+      $optionDefaults{"signature_common_target_min_percent"});  # Correction: bon parametre (70% par defaut)
+      # Fix: correct parameter (70% by default)
   my $maxSigOverlapPercent = 
     optionWithDefault($options_r, "max_overlap_percent",
       $optionDefaults{"max_overlap_percent"});
@@ -1634,46 +1635,48 @@ sub getOligosWithMismatchTolerance {
             my $spacingPenalty = 0;
             my $primer3Penalty = 0;
             my $detailStr = "";
+            # Clamper les distances au max des tableaux de penalites (evite index OOB silencieux → undef)
+            # Clamp distances to max penalty array index (prevents silent OOB → undef penalty)
+            my $maxPenIdx = $signatureMaxLength - 1;
+            my $d_stem   = ($innerToStemDistance   < $maxPenIdx) ? $innerToStemDistance   : $maxPenIdx;
+            my $d_middle = ($innerToMiddleDistance < $maxPenIdx) ? $innerToMiddleDistance : $maxPenIdx;
+            my $d_outer  = ($middleToOuterDistance < $maxPenIdx) ? $middleToOuterDistance : $maxPenIdx;
+
             if($includeStemPrimers == $TRUE)
             {
               # STEM ARCHITECTURE: Calculate spacing between inner-STEM and inner-middle
               $spacingPenalty = 
-	        ($innerToLoopPenalties_r->[$innerToStemDistance] * 
-	         $innerToStemPenaltyWeight) +
-                ($innerToMiddlePenalties_r->[$innerToMiddleDistance] *
-		 $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$middleToOuterDistance] *
-	         $middleToOuterPenaltyWeight);
+                ($innerToLoopPenalties_r->[$d_stem]    * $innerToStemPenaltyWeight) +
+                ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight) +
+                ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight);
               $primer3Penalty = 
-	        $innerPenalty * $innerPenaltyWeight +
-	        $stemPenalty * $stemPenaltyWeight +
-	        $middlePenalty * $middlePenaltyWeight +
-	        $outerPenalty * $outerPenaltyWeight;
+                $innerPenalty * $innerPenaltyWeight +
+                $stemPenalty  * $stemPenaltyWeight +
+                $middlePenalty * $middlePenaltyWeight +
+                $outerPenalty * $outerPenaltyWeight;
               
               $detailStr = sprintf("Spc[I_S:%.1f I_M:%.1f M_O:%.1f] Thm[I:%.1f S:%.1f M:%.1f O:%.1f]",
-                    ($innerToLoopPenalties_r->[$innerToStemDistance] * $innerToStemPenaltyWeight),
-                    ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                    ($innerToLoopPenalties_r->[$d_stem]    * $innerToStemPenaltyWeight),
+                    ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight),
+                    ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight),
                     ($innerPenalty * $innerPenaltyWeight),
-                    ($stemPenalty * $stemPenaltyWeight),
+                    ($stemPenalty  * $stemPenaltyWeight),
                     ($middlePenalty * $middlePenaltyWeight),
                     ($outerPenalty * $outerPenaltyWeight));
             }
             else
             {
               $spacingPenalty = 
-	        ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * 
-	         $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$middleToOuterDistance] *
-	          $middleToOuterPenaltyWeight);
+                ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight) +
+                ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight);
               $primer3Penalty = 
-	        $innerPenalty * $innerPenaltyWeight +
-	        $middlePenalty * $middlePenaltyWeight +
-	        $outerPenalty * $outerPenaltyWeight;
+                $innerPenalty * $innerPenaltyWeight +
+                $middlePenalty * $middlePenaltyWeight +
+                $outerPenalty * $outerPenaltyWeight;
               
               $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]",
-                    ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                    ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight),
+                    ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight),
                     ($innerPenalty * $innerPenaltyWeight),
                     ($middlePenalty * $middlePenaltyWeight),
                     ($outerPenalty * $outerPenaltyWeight));
@@ -1923,46 +1926,47 @@ sub getOligosWithMismatchTolerance {
             my $spacingPenalty = 0;
             my $primer3Penalty = 0;
             my $detailStr = "";
+            # Clamper les distances au max des tableaux de penalites / Clamp distances to max penalty array index
+            my $maxPenIdx_r = $signatureMaxLength - 1;
+            my $d_stem_r   = ($innerToStemDistance   < $maxPenIdx_r) ? $innerToStemDistance   : $maxPenIdx_r;
+            my $d_middle_r = ($innerToMiddleDistance < $maxPenIdx_r) ? $innerToMiddleDistance : $maxPenIdx_r;
+            my $d_outer_r  = ($middleToOuterDistance < $maxPenIdx_r) ? $middleToOuterDistance : $maxPenIdx_r;
+
             if($includeStemPrimers == $TRUE)
             {
               # STEM ARCHITECTURE: Calculate spacing between inner-STEM and inner-middle
               $spacingPenalty = 
-	        ($innerToLoopPenalties_r->[$innerToStemDistance] * 
-	         $innerToStemPenaltyWeight) +
-                ($innerToMiddlePenalties_r->[$innerToMiddleDistance] *
-		 $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$middleToOuterDistance] *
-	         $middleToOuterPenaltyWeight);
+                ($innerToLoopPenalties_r->[$d_stem_r]    * $innerToStemPenaltyWeight) +
+                ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight) +
+                ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight);
               $primer3Penalty = 
-	        $innerPenalty * $innerPenaltyWeight +
-	        $stemPenalty * $stemPenaltyWeight +
-	        $middlePenalty * $middlePenaltyWeight +
-	        $outerPenalty * $outerPenaltyWeight;
+                $innerPenalty * $innerPenaltyWeight +
+                $stemPenalty  * $stemPenaltyWeight +
+                $middlePenalty * $middlePenaltyWeight +
+                $outerPenalty * $outerPenaltyWeight;
               
               $detailStr = sprintf("Spc[I_S:%.1f I_M:%.1f M_O:%.1f] Thm[I:%.1f S:%.1f M:%.1f O:%.1f]",
-                    ($innerToLoopPenalties_r->[$innerToStemDistance] * $innerToStemPenaltyWeight),
-                    ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                    ($innerToLoopPenalties_r->[$d_stem_r]    * $innerToStemPenaltyWeight),
+                    ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight),
+                    ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight),
                     ($innerPenalty * $innerPenaltyWeight),
-                    ($stemPenalty * $stemPenaltyWeight),
+                    ($stemPenalty  * $stemPenaltyWeight),
                     ($middlePenalty * $middlePenaltyWeight),
                     ($outerPenalty * $outerPenaltyWeight));
             }
             else
             {
               $spacingPenalty = 
-	        ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * 
-	         $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$middleToOuterDistance] *
-	          $middleToOuterPenaltyWeight);
+                ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight) +
+                ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight);
               $primer3Penalty = 
-	        $innerPenalty * $innerPenaltyWeight +
-	        $middlePenalty * $middlePenaltyWeight +
-	        $outerPenalty * $outerPenaltyWeight;
+                $innerPenalty * $innerPenaltyWeight +
+                $middlePenalty * $middlePenaltyWeight +
+                $outerPenalty * $outerPenaltyWeight;
               
               $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]",
-                    ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                    ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight),
+                    ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight),
                     ($innerPenalty * $innerPenaltyWeight),
                     ($middlePenalty * $middlePenaltyWeight),
                     ($outerPenalty * $outerPenaltyWeight));
