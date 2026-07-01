@@ -1178,3 +1178,26 @@ Dans le design d'amorces LAMP sur des génomes complets ou des alignements multi
 **Impact attendu** :
 Une accélération majeure de la phase d'assemblage combinatoire (BigMerge) sur les génomes longs ou hautement variables, avec des temps de calcul divisés par 10 ou plus, tout en maintenant la couverture globale et la qualité thermodynamique des signatures LAMP générées.
 
+---
+
+### [2026-07-01] Bug Fix : Filtrage effectif des signatures sous le seuil de couverture dans .primers
+
+**Date/Étape** : 2026-07-01 — Correction du bug de non-filtrage des signatures rejetées lors de l'écriture du fichier principal.
+
+**Fichiers impactés** :
+- [lava_stem_primer.pl](file:///Users/cheikhtalibouya/Documents/lava/Nouveau%20dossier%20lava/lava-dna-master/lava_stem_primer.pl)
+- [lava_loop_primer.pl](file:///Users/cheikhtalibouya/Documents/lava/Nouveau%20dossier%20lava/lava-dna-master/lava_loop_primer.pl)
+
+**Nature du changement** : [Bug Fix / Algorithmique]
+
+**Explication technique** :
+1. **Évaluation sans filtrage** : Les scripts Perl évaluaient bien la couverture universelle de chaque signature complète via `calculateSignatureIntersection` et lui assignaient un tag `validation_status` (valant `"VALIDEE"` ou `"REJETEE..."`). Cependant, les signatures rejetées n'étaient jamais retirées de la liste active `$allFoundSignatures_r`.
+2. **Filtrage explicite** : Ajout d'une opération `grep` sur la liste `$allFoundSignatures_r` immédiatement après l'écriture du rapport global de traçabilité `.all_signatures` et juste avant la réduction finale par chevauchement (`reduceSignaturesByOverlap`).
+3. **Maintien de la cohérence** : Les signatures n'ayant pas le statut `"VALIDEE"` sont exclues de `$allFoundSignatures_r` de sorte qu'elles ne soient jamais écrites dans le fichier principal de référence des amorces `.primers`.
+
+**Justification biologique** :
+La validation diagnostique d'un assay LAMP exige le strict respect de la sensibilité ciblée. Permettre à des signatures n'atteignant pas le seuil de couverture minimale (ex: 70%) d'être exportées dans le fichier principal d'amorces `.primers` pouvait conduire l'utilisateur final à synthétiser des sets d'amorces incapables de couvrir l'ensemble des isolats cliniques ciblés, provoquant de faux-négatifs.
+
+**Impact attendu** :
+Le fichier de sortie de référence `.primers` ne contient désormais **strictement que des signatures validées** ayant une couverture supérieure ou égale au seuil de couverture requis par l'utilisateur (ex: 70%). Les signatures sous le seuil restent listées dans `.all_signatures` avec la mention `REJETEE` à des fins de diagnostic et de traçabilité.
+

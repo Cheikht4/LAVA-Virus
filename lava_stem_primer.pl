@@ -2270,6 +2270,11 @@ sub getOligosWithMismatchTolerance {
   close(OUTALLSIGS) ||
     confess("file error - failed to close output file \"$allSignaturesFileName\": $!");
 
+  # Filtrer pour ne garder que les signatures validées (couverture >= seuil) pour le fichier principal .primers
+  # Filter to only keep validated signatures (coverage >= threshold) for the main .primers file
+  my @valid_sigs = grep { $_->getTag("validation_status") eq "VALIDEE" } @{$allFoundSignatures_r};
+  $allFoundSignatures_r = \@valid_sigs;
+
   # NOW apply the overlap reduction for the main output files
   # Réduction finale des signatures par chevauchement / Final signature overlap reduction
   my $possibleSignatures_r = reduceSignaturesByOverlap(
