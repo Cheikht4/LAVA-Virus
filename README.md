@@ -25,10 +25,11 @@ LAVA-DNA Interface est une interface web moderne et intuitive pour le logiciel L
 
 ### **Prérequis système**
 - Ubuntu 20.04+ / Debian 11+ / WSL2 / macOS (via Homebrew)
-- Python 3.8+
-- Perl 5.20+
-- Primer3 2.6.1+
-- BioPerl
+- Python 3.9+
+- Perl 5.26+
+- Primer3 **2.6.1** (version testée et validée)
+- BioPerl 1.6.924+
+- Flask 3.0.3+ (interface web uniquement)
 
 ### **Installation manuelle**
 
@@ -255,7 +256,12 @@ Vous pouvez ensuite installer un certificat HTTPS gratuit via `certbot`. La plat
 
 ## 📄 **Licence**
 
-Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
+Ce projet utilise une licence **double** :
+
+- Le **moteur LAVA hérité** (`lava_loop_primer.pl`, `lava_stem_primer.pl`, modules `lib/LLNL/LAVA/` hérités) est distribué sous licence **BSD 3-Clause** — Copyright (c) 2010, Lawrence Livermore National Security, LLC. (Clinton Torres).
+- Les **extensions et l'interface web** (`lib/LLNL/LAVA/Validator.pm`, `Core.pm`, `PipelineUtils.pm`, `lava_flask_app.py`) sont distribués sous licence **BSD 3-Clause** — Copyright (c) 2026, Cheikh Talibouya.
+
+Voir le fichier [`LICENSE`](LICENSE) pour les termes complets.
 
 ## 🙏 **Remerciements**
 
@@ -266,9 +272,9 @@ Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
 
 ## 📞 **Support**
 
-- **Issues** : [GitHub Issues](https://github.com/votre-username/lava-dna-interface/issues)
+- **Issues** : [GitHub Issues](https://github.com/Cheikht4/lava-dna-portable/issues)
 - **Documentation** : `DOCUMENTATION_LAVA.txt`
-- **Email** : votre-email@example.com
+- **Email** : cheikhtalibouya.toure04@gmail.com | cheikhtalibouya.toure@pasteur.sn
 
 ---
 

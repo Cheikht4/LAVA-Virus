@@ -187,7 +187,7 @@ dependencies:
   - perl-xml-xpathengine=0.14=pl526_2
   - perl-xsloader=0.24=pl526_0
   - perl-yaml=1.29=pl526_0
-  - primer3=2.5.0=pl526h6de7cb9_0
+  - primer3=2.6.1  # Version testée et validée / Tested and validated version
   - tidyp=1.04=1
   - xz=5.2.4=h0b31af3_1002
   - zlib=1.2.11=h0b31af3_1006
