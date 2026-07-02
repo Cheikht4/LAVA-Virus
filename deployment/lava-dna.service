@@ -11,9 +11,12 @@ Group=lavauser
 WorkingDirectory=/opt/lava-dna
 Environment=PATH=/opt/lava-dna/venv/bin
 Environment=FLASK_ENV=production
-Environment=FLASK_SECRET_KEY=your-secret-key-here
-Environment=LAVA_ADMIN_PASSWORD=your-admin-password-here
-ExecStart=/opt/lava-dna/venv/bin/gunicorn --config /opt/lava-dna/deployment/gunicorn_config.py lava_flask_app_secure:create_app()
+Environment=SECRET_KEY=remplacer-par-une-cle-secrete-aleatoire-statique
+Environment=ALLOW_SELF_SHUTDOWN=False
+Environment=MAX_CONCURRENT_RUNS=5
+Environment=MAX_USER_CONCURRENT_RUNS=2
+Environment=DATA_RETENTION_HOURS=48
+ExecStart=/opt/lava-dna/venv/bin/gunicorn --config /opt/lava-dna/deployment/gunicorn_config.py lava_flask_app:app
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=on-failure
 RestartSec=10

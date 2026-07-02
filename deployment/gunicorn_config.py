@@ -4,12 +4,13 @@ import os
 
 # Serveur
 bind = "127.0.0.1:8000"
-workers = multiprocessing.cpu_count() * 2 + 1
-worker_class = "sync"
+workers = 1
+threads = 4
+worker_class = "gthread"
 worker_connections = 1000
 max_requests = 1000
 max_requests_jitter = 100
-timeout = 300  # 5 minutes pour les longues exécutions
+timeout = 120  # 120 secondes pour les lancements LAVA
 keepalive = 2
 
 # Sécurité

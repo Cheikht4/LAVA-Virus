@@ -331,13 +331,60 @@ TRANSLATIONS = {
 }
 
 app = Flask(__name__)
-# Sécurité : Utiliser une valeur générée au vol si non définie dans l'environnement pour éviter le spoofing
-app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
+flask_env = os.environ.get('FLASK_ENV', 'development')
+secret_key = os.environ.get('SECRET_KEY')
+if not secret_key:
+    if flask_env == 'production':
+        raise RuntimeError("ERREUR CRITIQUE DE SECURITE : Variable d'environnement SECRET_KEY obligatoire en mode production.")
+    secret_key = os.urandom(24)
+app.secret_key = secret_key
 app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024 * 1024  # 1GB max file size
+
+# Securisation des cookies de session (Priorite 2)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax'
+)
+if flask_env == 'production' or os.environ.get('SESSION_COOKIE_SECURE', 'False').lower() in ('true', '1', 't'):
+    app.config['SESSION_COOKIE_SECURE'] = True
+
+import uuid
+import time as time_module
+from collections import defaultdict
+
+# Rate limiter leger par IP (Priorite 5)
+ip_request_history = defaultdict(list)
+
+def check_rate_limit(max_requests=15, window_seconds=60):
+    client_ip = request.remote_addr or 'unknown'
+    now = time_module.time()
+    ip_request_history[client_ip] = [t for t in ip_request_history[client_ip] if now - t < window_seconds]
+    if len(ip_request_history[client_ip]) >= max_requests:
+        return False
+    ip_request_history[client_ip].append(now)
+    return True
+
+def check_execution_ownership(execution_id):
+    """Verifie que l'execution appartient bien au visiteur courant"""
+    if execution_id not in running_executions:
+        from flask import abort
+        abort(404)
+    execution = running_executions[execution_id]
+    owner_id = execution.get('owner_id')
+    if owner_id and owner_id != session.get('user_id'):
+        from flask import abort
+        abort(403)
+
+@app.errorhandler(500)
+def handle_internal_error(error):
+    """Masquer les traces techniques en production"""
+    if os.environ.get('FLASK_ENV') == 'production':
+        return "Erreur interne du serveur. Veuillez reessayer ou contacter l'administrateur.", 500
+    return str(error), 500
 
 @app.after_request
 def add_header(response):
-    """Empêcher la mise en cache par le navigateur pour garantir que le changement de langue s'affiche immédiatement."""
+    """Empecher la mise en cache par le navigateur pour garantir que le changement de langue s'affiche immediatement."""
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '-1'
@@ -350,7 +397,9 @@ def basename_filter(path):
 
 @app.before_request
 def before_request():
-    """Définir la langue globale pour la requête"""
+    """Definir la langue globale pour la requete et attribuer un user_id anonyme"""
+    if 'user_id' not in session:
+        session['user_id'] = str(uuid.uuid4())
     g.lang = request.cookies.get('language', 'fr')
     if g.lang not in TRANSLATIONS:
         g.lang = 'fr'
@@ -558,6 +607,9 @@ def set_language(language):
 @app.route('/upload', methods=['POST'])
 def upload_file():
     """Upload du fichier FASTA"""
+    if not check_rate_limit(max_requests=15, window_seconds=60):
+        flash('Trop de requetes. Veuillez patienter une minute.', 'error')
+        return redirect(url_for('index'))
     if 'fasta_file' not in request.files:
         flash('Aucun fichier sélectionné', 'error')
         return redirect(url_for('index'))
@@ -939,56 +991,63 @@ def execute_lava_background(execution_id, script_type, input_file, output_name, 
 @app.route('/execute', methods=['POST'])
 def execute_lava():
     """Lancer l'exécution LAVA"""
+    if not check_rate_limit(max_requests=10, window_seconds=60):
+        flash("Trop de requêtes. Veuillez patienter une minute avant de lancer un nouveau calcul.", "error")
+        return redirect(url_for('index'))
+
     if 'uploaded_file' not in session:
         flash('Aucun fichier FASTA uploadé', 'error')
         return redirect(url_for('index'))
         
-    # --- FIX DE SÉCURITÉ : Anti-DDoS et Limitation Utilisateur ---
-    if 'user_id' not in session:
-        session['user_id'] = str(uuid.uuid4())
-        
-    # Compter les exécutions actives pour cet utilisateur
-    active_runs = sum(1 for e in running_executions.values() 
-                     if e.get('user_id') == session['user_id'] and e.get('status') in ['starting', 'running'])
-                     
-    if active_runs >= 1:
-        flash('Vous avez déjà une exécution en cours. Veuillez patienter la fin de l\'analyse avant d\'en lancer une nouvelle.', 'error')
-        return redirect(url_for('index'))
-    # -------------------------------------------------------------
+    # Vérification des quotas de concurrence
+    max_global = int(os.environ.get('MAX_CONCURRENT_RUNS', 5))
+    max_user = int(os.environ.get('MAX_USER_CONCURRENT_RUNS', 2))
+    current_user_id = session.get('user_id')
+
+    running_global = sum(1 for e in running_executions.values() if e.get('status') in ['starting', 'running'])
+    running_user = sum(1 for e in running_executions.values() if (e.get('owner_id') == current_user_id or e.get('user_id') == current_user_id) and e.get('status') in ['starting', 'running'])
+
+    if running_user >= max_user:
+        flash(f"Vous avez déjà {running_user} calculs en cours. Veuillez attendre leur fin avant d'en lancer un nouveau.", "warning")
+        return redirect(url_for('list_executions'))
+
+    if running_global >= max_global:
+        flash("Le serveur est actuellement à pleine capacité. Veuillez réessayer dans quelques instants.", "warning")
+        return redirect(url_for('list_executions'))
     
     # Récupérer les paramètres du formulaire actuel
     script_type = request.form.get('script_type', 'STEM').upper()
     
-    # --- FIX DE SÉCURITÉ : Liste Blanche ---
+    # Liste Blanche
     if script_type not in ['STEM', 'LOOP']:
         flash('Type de script invalide (seuls STEM ou LOOP sont autorisés).', 'error')
         return redirect(url_for('index'))
         
     output_name = request.form.get('output_name', 'lava_result')
     if not output_name:
-        output_name = f"lava_result_{int(time.time())}"
+        output_name = 'lava_result'
         
-    # --- FIX DE SÉCURITÉ : Path Traversal ---
-    output_name = secure_filename(output_name)
-    if not output_name:  # Si le nom ne contenait que des caractères illégaux
-        output_name = f"lava_result_{int(time.time())}"
-    
-    # Debug : afficher les données du formulaire
-    # Log des données du formulaire / Form data logging
-    app.logger.debug(f"Formulaire reçu: script_type={script_type}")
-    app.logger.debug(f"Session params script_type: {session.get('params', {}).get('script_type', 'UNKNOWN')}")
-    
-    # Traiter script_type en PREMIER
-    if 'script_type' in request.form:
-        session['params']['script_type'] = request.form['script_type']
-    
-    # Traiter lamp_mode en SECOND (après script_type)  
+    # S'assurer que session['params'] existe
+    if 'params' not in session:
+        session['params'] = _get_default_params(script_type)
+    else:
+        # Si le type de script a changé, on réinitialise ou on garde les paramètres communs
+        if session['params'].get('script_type') != script_type:
+            session['params'] = _get_default_params(script_type)
+        else:
+            # S'assurer que tous les paramètres existent
+            defaults = _get_default_params(script_type)
+            for k, v in defaults.items():
+                if k not in session['params']:
+                    session['params'][k] = v
+                    
+    session['params']['script_type'] = script_type
     if 'lamp_mode' in request.form:
-        _apply_lamp_mode(session['params'], request.form['lamp_mode'],
+        session['params']['lamp_mode'] = request.form['lamp_mode']
+    elif 'lamp_mode' not in session['params']:
+        session['params']['lamp_mode'] = _get_default_lamp_mode(
                         session['params']['script_type'])
     
-    # Traiter tous les autres paramètres du formulaire
-    # Process all other form parameters
     for key, value in request.form.items():
         if key not in ['script_type', 'lamp_mode', 'output_name']:
             if key in ['include_stem_primers', 'include_loop_primers']:
@@ -997,13 +1056,12 @@ def execute_lava():
                 session['params'][key] = _convert_param_value(key, value)
     
 
-    # Créer un ID unique pour cette exécution
     execution_id = str(uuid.uuid4())
     
-    # Initialiser l'exécution
     running_executions[execution_id] = {
         'id': execution_id,
         'user_id': session.get('user_id'),
+        'owner_id': session.get('user_id'),
         'status': 'starting',
         'input_file': session['uploaded_file'],
         'output_name': output_name,
@@ -1027,20 +1085,15 @@ def execute_lava():
 
 @app.route('/monitor/<execution_id>')
 def monitor(execution_id):
-    """Page de monitoring d'une exécution"""
-    if execution_id not in running_executions:
-        flash('Exécution non trouvée', 'error')
-        return redirect(url_for('index'))
-    
+    """Page de monitoring d'une execution"""
+    check_execution_ownership(execution_id)
     execution = running_executions[execution_id]
     return render_template('monitor.html', execution=execution)
 
 @app.route('/api/status/<execution_id>')
 def api_status(execution_id):
-    """API pour récupérer le statut d'une exécution"""
-    if execution_id not in running_executions:
-        return jsonify({'error': 'Execution not found'}), 404
-    
+    """API pour recuperer le statut d'une execution"""
+    check_execution_ownership(execution_id)
     execution = running_executions[execution_id]
     
     # Paramètre pour demander tous les logs
@@ -1140,11 +1193,8 @@ def api_status(execution_id):
 
 @app.route('/download-logs/<execution_id>')
 def download_logs(execution_id):
-    """Télécharger tous les logs d'une exécution"""
-    if execution_id not in running_executions:
-        flash('Exécution non trouvée', 'error')
-        return redirect(url_for('index'))
-    
+    """Telecharger tous les logs d'une execution"""
+    check_execution_ownership(execution_id)
     execution = running_executions[execution_id]
     logs = execution.get('logs', [])
     
@@ -1210,11 +1260,8 @@ def download_logs(execution_id):
 
 @app.route('/download-selected/<execution_id>', methods=['POST'])
 def download_selected_files(execution_id):
-    """Télécharger les fichiers sélectionnés en ZIP"""
-    if execution_id not in running_executions:
-        flash('Exécution non trouvée', 'error')
-        return redirect(url_for('index'))
-    
+    """Telecharger les fichiers selectionnes en ZIP"""
+    check_execution_ownership(execution_id)
     execution = running_executions[execution_id]
     if 'result_files' not in execution:
         flash('Aucun résultat disponible', 'error')
@@ -1267,11 +1314,8 @@ def download_selected_files(execution_id):
 
 @app.route('/download-all/<execution_id>')
 def download_all_files(execution_id):
-    """Télécharger tous les fichiers en ZIP"""
-    if execution_id not in running_executions:
-        flash('Exécution non trouvée', 'error')
-        return redirect(url_for('index'))
-    
+    """Telecharger tous les fichiers en ZIP"""
+    check_execution_ownership(execution_id)
     execution = running_executions[execution_id]
     if 'result_files' not in execution or not execution['result_files']:
         flash('Aucun résultat disponible', 'error')
@@ -1314,11 +1358,8 @@ def download_all_files(execution_id):
 
 @app.route('/download/<execution_id>/<filename>')
 def download_result(execution_id, filename):
-    """Télécharger un fichier de résultat"""
-    if execution_id not in running_executions:
-        flash('Exécution non trouvée', 'error')
-        return redirect(url_for('index'))
-    
+    """Telecharger un fichier de resultat"""
+    check_execution_ownership(execution_id)
     execution = running_executions[execution_id]
     if 'result_files' not in execution:
         flash('Aucun résultat disponible', 'error')
@@ -1334,18 +1375,21 @@ def download_result(execution_id, filename):
 
 @app.route('/executions')
 def list_executions():
-    """Liste toutes les exécutions"""
-    return render_template('executions.html', executions=running_executions)
+    """Liste toutes les executions"""
+    current_user = session.get('user_id')
+    filtered_execs = {k: v for k, v in running_executions.items() if v.get('owner_id') == current_user or v.get('user_id') == current_user}
+    return render_template('executions.html', executions=filtered_execs)
 
 @app.route('/stop/<execution_id>', methods=['POST'])
 def stop_execution(execution_id):
-    """Arrêter une exécution"""
+    """Arreter une execution"""
+    check_execution_ownership(execution_id)
     if execution_id in running_executions:
         execution = running_executions[execution_id]
         if 'process' in execution and execution['process'].poll() is None:
             execution['process'].terminate()
             execution['status'] = 'stopped'
-        flash('Exécution arrêtée', 'warning')
+        flash('Execution arretee', 'warning')
     
     return redirect(url_for('monitor', execution_id=execution_id))
 
@@ -1358,6 +1402,8 @@ shutdown_scheduled = False
 @app.route('/heartbeat-simple', methods=['POST'])
 def heartbeat_simple():
     """Heartbeat simple sans effets de bord"""
+    if not os.environ.get('ALLOW_SELF_SHUTDOWN', 'False').lower() in ('true', '1', 't'):
+        return {'status': 'disabled'}, 404
     session_id = session.get('session_id', str(time.time()))
     session['session_id'] = session_id
     active_sessions[session_id] = time.time()
@@ -1372,6 +1418,8 @@ def heartbeat_simple():
 @app.route('/really-closing', methods=['POST'])
 def really_closing():
     """Signal de fermeture très conservatif"""
+    if not os.environ.get('ALLOW_SELF_SHUTDOWN', 'False').lower() in ('true', '1', 't'):
+        return {'status': 'disabled'}, 404
     print("🔍 Signal de fermeture potentiel reçu...")
     
     def conservative_shutdown():
@@ -1403,6 +1451,8 @@ def really_closing():
 @app.route('/long-inactivity', methods=['POST'])
 def long_inactivity():
     """Inactivité très prolongée détectée"""
+    if not os.environ.get('ALLOW_SELF_SHUTDOWN', 'False').lower() in ('true', '1', 't'):
+        return {'status': 'disabled'}, 404
     print("💤 Inactivité prolongée (10+ minutes)")
     
     def inactivity_shutdown():
@@ -1430,6 +1480,8 @@ shutdown_timer = None
 @app.route('/stay-alive', methods=['POST'])
 def stay_alive():
     """Signal de vie du navigateur"""
+    if not os.environ.get('ALLOW_SELF_SHUTDOWN', 'False').lower() in ('true', '1', 't'):
+        return {'status': 'disabled'}, 404
     session_id = session.get('session_id', str(time.time()))
     session['session_id'] = session_id
     session['last_alive'] = datetime.now()
@@ -1447,6 +1499,8 @@ def stay_alive():
 @app.route('/maybe-closing', methods=['POST'])
 def maybe_closing():
     """Signal possible de fermeture"""
+    if not os.environ.get('ALLOW_SELF_SHUTDOWN', 'False').lower() in ('true', '1', 't'):
+        return {'status': 'disabled'}, 404
     print("🤔 Signal possible de fermeture reçu...")
     
     def check_if_really_closed():
@@ -1476,6 +1530,8 @@ def maybe_closing():
 @app.route('/page-hidden', methods=['POST'])
 def page_hidden():
     """Page cachée depuis longtemps"""
+    if not os.environ.get('ALLOW_SELF_SHUTDOWN', 'False').lower() in ('true', '1', 't'):
+        return {'status': 'disabled'}, 404
     print("👁️  Page cachée détectée...")
     
     def delayed_check():
@@ -1493,6 +1549,44 @@ def page_hidden():
     threading.Thread(target=delayed_check, daemon=True).start()
     return {'status': 'monitoring'}
 
+def background_data_cleanup():
+    """Purge synchronisée des fichiers et des exécutions terminées depuis longtemps"""
+    import shutil
+    while True:
+        time_module.sleep(3600)  # Vérification toutes les heures
+        try:
+            retention_hours = float(os.environ.get('DATA_RETENTION_HOURS', 48))
+            retention_seconds = retention_hours * 3600
+            now = datetime.now()
+
+            to_remove = []
+            for exec_id, exec_data in list(running_executions.items()):
+                if exec_data.get('status') in ['starting', 'running']:
+                    continue
+                end_time_str = exec_data.get('end_time')
+                if end_time_str:
+                    try:
+                        end_time = datetime.strptime(end_time_str, '%Y-%m-%d %H:%M:%S')
+                        if (now - end_time).total_seconds() > retention_seconds:
+                            to_remove.append(exec_id)
+                    except Exception:
+                        pass
+
+            for exec_id in to_remove:
+                exec_data = running_executions.pop(exec_id, None)
+                if exec_data:
+                    upload_path = exec_data.get('input_file') or exec_data.get('target_file')
+                    if upload_path and os.path.exists(upload_path):
+                        try: os.remove(upload_path)
+                        except Exception: pass
+                    output_dir = exec_data.get('output_dir')
+                    if output_dir and os.path.exists(output_dir):
+                        try: shutil.rmtree(output_dir, ignore_errors=True)
+                        except Exception: pass
+        except Exception as e:
+            print(f"Erreur purge automatique: {e}")
+
+threading.Thread(target=background_data_cleanup, daemon=True).start()
 
 if __name__ == '__main__':
     print("🧬 LAVA-DNA Flask Interface")
@@ -1502,4 +1596,5 @@ if __name__ == '__main__':
     print("=" * 40)
     
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() in ('true', '1', 't')
-    app.run(debug=debug_mode, host='0.0.0.0', port=5001)
+    listen_host = os.environ.get('FLASK_HOST', '127.0.0.1')
+    app.run(debug=debug_mode, host=listen_host, port=int(os.environ.get('FLASK_PORT', 5001)))
