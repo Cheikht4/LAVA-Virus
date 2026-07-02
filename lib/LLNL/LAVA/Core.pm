@@ -39,12 +39,23 @@ sub calculate_proportional_geometry {
 }
 
 #=============================================================================
-# GENERATE SIGMOID PENALTY
+# GENERATE SIGMOID PENALTY (ASYMMETRIC)
 #=============================================================================
-# Calcule une pénalité basée sur une courbe sigmoïde. / Calculates a penalty based on a sigmoid curve.
-# Zone de confort (plateau 0) : +/- 15% de la cible.
-# Au-delà : augmentation fluide logistique. / Beyond: smooth logistic increase.
-# SIGMOÏDE GÉNÉRALISÉE PERMISSIVE (LAVA 2026 UPDATE)
+# Calcule une pénalité basée sur une courbe sigmoïde asymétrique.
+# Calculates a penalty based on an asymmetric sigmoid curve.
+#
+# Logique biologique / Biological logic:
+# - Les distances plus courtes que la cible sont favorables stériquement et cinétiquement -> Pénalité = 0.
+#   Distances shorter than the target are sterically and kinetically favorable -> Penalty = 0.
+# - Les distances plus longues (amplicon étiré) nuisent à la réaction -> Pénalité progressive.
+#   Longer distances (stretched amplicon) hinder the reaction -> Progressive penalty.
+#
+# Paramètres / Parameters:
+#   actual         - Distance réelle observée / Actual observed distance
+#   target         - Distance cible idéale proportionnelle / Ideal proportional target distance
+#   plateau_ratio  - Pourcentage au-dessus de la cible toléré sans pénalité / Plateau ratio above target
+#   k_slope        - Facteur de pente pour la montée de pénalité / Slope factor for penalty increase
+#
 sub generateSigmoidPenalty {
     my ($actual, $target, $plateau_ratio, $k_slope) = @_;
     
@@ -54,27 +65,28 @@ sub generateSigmoidPenalty {
     
     return 100 if $actual < 0; 
     
-    # Paramètres du modèle "Colline Douce" / "Smooth Hill" model parameters
-    my $L_plateau_width = $target * $plateau_ratio; # Plateau "gratuit" de +/- X%
+    # Les distances plus courtes ou égales à la cible sont idéales cinétiquement (pas de pénalité)
+    # Distances shorter than or equal to the target are kinetically ideal (no penalty)
+    return 0 if $actual <= $target;
+    
+    # Paramètres de la montée progressive au-dessus de la cible
+    # Parameters for progressive rise above target
+    my $L_plateau_width = $target * $plateau_ratio; # Plateau "gratuit" de + X% au-dessus de la cible
     my $max_penalty = 100;
     
-    my $diff = abs($actual - $target);
+    my $diff = $actual - $target;
     
-    # Formule Sigmoïde Généralisée : P(x) = 100 / (1 + exp(-k * (|x - T| - L))) / Generalized Sigmoid Formula: P(x) = 100 / (1 + exp(-k * (|x - T| - L)))
-    # Si diff < L, l'exposant est positif et grand -> exp() grand -> P ~ 0
-    # Si diff > L, l'exposant devient négatif -> exp() petit -> P augmente vers 100 / If diff > L, exponent becomes negative -> exp() small -> P increases towards 100
-    
-    # Note : Pour assurer un VRAI zéro dans le plateau, on garde une condition explicite / Note: To ensure a TRUE zero in the plateau, we keep an explicit condition
+    # Si l'excès reste dans le plateau de tolérance gratuit, pas de pénalité
+    # If the excess remains within the free tolerance plateau, no penalty
     return 0 if $diff <= $L_plateau_width;
 
-    # Calcul de la pénalité progressive au-delà du plateau / Calculation of progressive penalty beyond the plateau
-    # On décale 'x' de la largeur du plateau pour que la montée commence à 0 après la limite / Shift 'x' by plateau width so the rise starts at 0 after the limit
+    # Calcul de la pénalité progressive au-delà du plateau
+    # Calculation of progressive penalty beyond the plateau
     my $excess = $diff - $L_plateau_width;
     
-    # Nouvelle Formule Sigmoïde corrigée (commence à 0 mathématiquement) / New corrected Sigmoid Formula (starts at 0 mathematically)
+    # Formule Sigmoïde corrigée (commence à 0 après la limite du plateau)
+    # Corrected Sigmoid Formula (starts at 0 after the plateau limit)
     # P(x) = max_penalty * [ (2 / (1 + exp(-k * x))) - 1 ]
-    # Si x = 0 => P(0) = max_penalty * [ 2/2 - 1 ] = 0
-    # Si x = inf => P(inf) = max_penalty * [ 2/1 - 1 ] = max_penalty
     my $penalty = $max_penalty * ( (2 / (1 + exp(-$k_slope * $excess))) - 1 );
     
     return $penalty;

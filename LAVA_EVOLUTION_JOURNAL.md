@@ -1223,3 +1223,27 @@ Les réactions d'amplification isotherme (LAMP) ou PCR tolèrent couramment de l
 
 **Impact attendu** :
 Une évaluation exacte et cohérente de la tolérance aux mismatches pour toutes les amorces du set LAMP (Inner, Middle, Outer, et Loops). Les taux de couverture individuelle et globale des signatures générées reflètent désormais fidèlement les contraintes thermodynamiques configurées, augmentant ainsi de manière significative la quantité de signatures validées trouvées sur des cibles à forte diversité génomique.
+
+---
+
+### [2026-07-02] Optimisation : Formule Asymétrique de Pénalité Géométrique (Sigmoïde Asymétrique)
+
+**Date/Étape** : 2026-07-02 — Remplacement de la pénalité de distance symétrique par une pénalité de distance asymétrique pour favoriser les architectures d'amorces compactes.
+
+**Fichiers impactés** :
+- [lib/LLNL/LAVA/Core.pm](file:///Users/cheikhtalibouya/Documents/lava/Nouveau%20dossier%20lava/lava-dna-master/lib/LLNL/LAVA/Core.pm)
+
+**Nature du changement** : [Thermodynamique / Architecture / Algorithmique]
+
+**Explication technique** :
+1. **Asymétrie des distances** : Modification de la routine `generateSigmoidPenalty` dans `Core.pm`. Auparavant, la pénalité sigmoïde était calculée à partir de la valeur absolue de l'écart par rapport à la cible (`abs($actual - $target)`). Elle pénalisait donc symétriquement les espacements trop courts et trop longs.
+2. **Annulation en zone courte** : La fonction applique désormais une condition d'asymétrie : si la distance stérique réelle observée entre deux amorces adjacentes (ex: F3-F2 ou F2-LOOP) est inférieure ou égale à la cible idéale proportionnelle (`$actual <= $target`), la pénalité de distance est immédiatement ramenée à **0**.
+3. **Maintien de la pénalité en zone longue** : Seules les distances réelles supérieures à la cible plus le plateau gratuit de tolérance (`$actual > $target + $L_plateau_width`) subissent la montée de pénalité sigmoïde progressive, afin de pénaliser les amplicons trop étirés.
+
+**Justification biologique** :
+Dans la cinétique moléculaire d'amplification d'une réaction isotherme LAMP, la distance stérique séparant les amorces réelles n'a pas besoin d'être strictement égale à la proportionnalité théorique. 
+- Une distance plus courte que la cible est **fortement avantageuse** : elle rapproche F3 de F2 (ou B3 de B2), ce qui accélère la cinétique de déplacement de brin par la Bst polymérase et améliore le taux de réplication isotherme, à condition qu'il n'y ait pas de chevauchement d'amorces (déjà empêché par le filtre strict de distance minimale `--min_primer_spacing` $\ge 1$ base).
+- Pénaliser lourdement (ex: pénalité de 40 à 80) une signature compacte et performante sous prétexte qu'elle a un faible espacement était un contresens physique. Cette modification permet de libérer le design combinatoire et de retenir des signatures hautement efficaces dans le tube de réaction.
+
+**Impact attendu** :
+Une réduction drastique et immédiate des scores de pénalité pour les signatures d'amorces d'amplicons courts et optimaux (chute des scores de Spc de >200 à 0, ne laissant que la pénalité thermodynamique pure de Primer3 ~15). Ces signatures hautement performantes seront désormais classées en tête par le pipeline de LAVA.
