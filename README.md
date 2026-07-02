@@ -2,10 +2,11 @@
 
 > **Interface graphique moderne pour la conception de primers LAMP avec LAVA**
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
-[![Flask](https://img.shields.io/badge/Flask-2.3+-green.svg)](https://flask.palletsprojects.com)
-[![Perl](https://img.shields.io/badge/Perl-5.20+-orange.svg)](https://perl.org)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+[![Flask](https://img.shields.io/badge/Flask-3.0+-green.svg)](https://flask.palletsprojects.com)
+[![Perl](https://img.shields.io/badge/Perl-5.26+-orange.svg)](https://perl.org)
+[![Primer3](https://img.shields.io/badge/Primer3-2.6.1-purple.svg)](https://primer3.org)
+[![License](https://img.shields.io/badge/License-BSD--3--Clause-yellow.svg)](LICENSE)
 
 ## 🎯 **Vue d'ensemble**
 
