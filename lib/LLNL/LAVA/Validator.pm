@@ -422,8 +422,8 @@ sub validateCompleteSignatureSpacing
   # Créer une liste ordonnée de tous les primers avec leurs positions / Create ordered primer list
   my @allPrimers = ();
   
-  # Ajouter les primers forward (F3, F2, F1, FSTEM) — strand par défaut : plus
-  # Add forward primers (F3, F2, F1, FSTEM) — default strand: plus
+  # Ajouter les primers forward (F3, F2, F1, FSTEM) - strand par défaut : plus
+  # Add forward primers (F3, F2, F1, FSTEM) - default strand: plus
   foreach my $primer (@{$forwardPrimers_r}) {
     next if (!defined $primer);
     my $location = $primer->getLocation();
@@ -452,8 +452,8 @@ sub validateCompleteSignatureSpacing
     };
   }
   
-  # Ajouter les primers reverse (BSTEM, B1, B2, B3) — strand par défaut : minus
-  # Add reverse primers (BSTEM, B1, B2, B3) — default strand: minus
+  # Ajouter les primers reverse (BSTEM, B1, B2, B3) - strand par défaut : minus
+  # Add reverse primers (BSTEM, B1, B2, B3) - default strand: minus
   foreach my $primer (@{$reversePrimers_r}) {
     next if (!defined $primer);
     my $location = $primer->getLocation();

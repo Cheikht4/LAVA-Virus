@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Copyright (c) 2026, Cheikh Talibouya <cheikhtalibouya.toure04@gmail.com | cheikhtalibouya.toure@pasteur.sn>.
-# BSD 3-Clause License — See LICENSE at root of project.
+# BSD 3-Clause License - See LICENSE at root of project.
 #
 # Tests unitaires pour LLNL::LAVA::Validator
 # Unit tests for LLNL::LAVA::Validator

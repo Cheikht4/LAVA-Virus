@@ -85,3 +85,16 @@ See the [LICENSE](LICENSE) file for complete terms.
 - **Original LAVA Engine**: Developed at Lawrence Livermore National Laboratory (LLNL) by Clinton Torres (2010).
 - **Algorithmic Foundations**: LAVA methodology and conservation scoring adaptations referenced in Bekaert et al. (2016).
 - **Primer3 Core**: Rozen & Skaletsky for the foundational Primer3 thermodynamic calculation library.
+
+### Legacy Funding & Grant Notices
+
+This work was supported by a NIBIB Point-of-Care Technologies Research Network Center grant (Gerald J. Kost, PI of the UC Davis / LLNL POCT Center, NIH U54 EB007959). The content is solely the responsibility of the authors and does not necessarily represent the official views of the National Institute of Biomedical Imaging and Bioengineering or the National Institutes of Health.
+
+This work performed under the auspices of the U.S. Department of Energy by Lawrence Livermore National Laboratory under Contract DE-AC52-07NA27344.
+
+### Release History
+
+- **LAVA release 0.1.3**: Compatibility with Primer3 thermodynamic embedded parameters.
+- **LAVA release 0.1.2** (Michael Bekaert): Cross-distribution Linux compatibility and parameter exposure (`outer_pair_target_length`, `middle_pair_target_length`, `inner_pair_target_length`).
+- **LAVA release 0.1.1** (Michael Bekaert): Primer3 and BioPerl updates, thermodynamic path parameter (`PRIMER_THERMODYNAMIC_PARAMETERS_PATH`).
+- **LAVA release 0.1** (Clinton Torres): Original distribution and LAMP multiple sequence alignment algorithm.

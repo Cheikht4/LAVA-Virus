@@ -925,9 +925,9 @@ sub getOligosWithMismatchTolerance {
 
 
   # Option B : Generation NATIVE des Reverse Outer via Primer3 sur RC(MSA)
-  # Les Reverse sont generes independamment des Forward — protection 3' garantie
+  # Les Reverse sont generes independamment des Forward - protection 3' garantie
   # Option B: NATIVE Outer Reverse generation via Primer3 on RC(MSA)
-  # Reverse primers generated independently from Forward — 3' protection guaranteed
+  # Reverse primers generated independently from Forward - 3' protection guaranteed
   print "Enumerating outer NATIVE reverse primers (Option B)\n";
   my @outerReversePrimers = buildNativeReversePool(
     $outerEnumerator, $inputMSA,

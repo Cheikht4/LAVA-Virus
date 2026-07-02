@@ -185,10 +185,10 @@ is automatically applied to both pipelines.
 
 =head2 buildReversePrimers (DEPRECATED)
 
-B<DEPRECATED> — Cette fonction est conservée pour compatibilité ascendante uniquement.
+B<DEPRECATED> - Cette fonction est conservée pour compatibilité ascendante uniquement.
 Elle ne doit plus être appelée dans les nouveaux scripts.
 
-B<DEPRECATED> — This function is retained for backward compatibility only.
+B<DEPRECATED> - This function is retained for backward compatibility only.
 It must not be called in new scripts.
 
 Utiliser buildNativeReversePool à la place, qui génère nativement les amorces
