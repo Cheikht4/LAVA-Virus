@@ -196,110 +196,119 @@ sub checkPrimerMismatchTolerance {
   my $perfect_match_percent = ($perfect_match_count / $total_regions) * 100;
   
   # ========================================================================
-  # PHASE 2b: DÉCISION RAPIDE (EARLY EXIT)
+  # PHASE 2b: DÉCISION RAPIDE MODIFIÉE (SANS EARLY EXIT COMPLET)
   # ========================================================================
-  if ($perfect_match_percent >= $min_primer_coverage) {
-    return ($candidate_primer_uc, $perfect_match_percent, 0, [map {$_->{seq_idx}} @perfect_matches]);
-  }
-  
-  # ========================================================================
-  # PHASE 3: ANALYSE POSITION PAR POSITION (Avec contraintes de dégénérescence) / PHASE 3: POSITION BY POSITION ANALYSIS (With degeneracy constraints)
-  # ========================================================================
-  
   my $optimized_primer = $candidate_primer_uc;
-  my @position_compatible_seqs = ();
   my $has_modifications = 0;
+  my ($three_prime_start_idx, $three_prime_end_idx);
   
-  my $degen_total = 0;
-  my $degen_consec = 0;
-  my $degen_3p = 0;
-  
-  # L'extrémité 3' est TOUJOURS à la fin de la chaîne (5' -> 3') / The 3' end is ALWAYS at the end of the chain (5' -> 3') 
-  # car les séquences cibles ont déjà été RC si nécessaire. / because target sequences have already been RC if necessary.
-  # 3' end is ALWAYS at the end of the string (5' -> 3') since targets are RC'd.
-  my $three_prime_start_idx = $length - $zone_size;
-  $three_prime_start_idx = 0 if $three_prime_start_idx < 0;
-  my $three_prime_end_idx = $length - 1;
-  
-  # Initialiser tracking
-  for my $pos_offset (0 .. $length - 1) {
-    $position_compatible_seqs[$pos_offset] = [ map { $_->{seq_idx} } @perfect_matches ];
-  }
-  
-  for my $pos_offset (0 .. $length - 1) {
-    my $primer_base = substr($candidate_primer_uc, $pos_offset, 1);
-    my %base_counts = ();
-    my @position_matches = @{$position_compatible_seqs[$pos_offset]};
-    
-    for my $target (@non_matches) {
-      my $target_base = substr($target->{region}, $pos_offset, 1);
-      $base_counts{$target_base}++;
-      if ($target_base eq $primer_base) {
-        push @position_matches, $target->{seq_idx};
-      }
-    }
-    
-    my $primer_base_count = $base_counts{$primer_base} || 0;
-    my $total_primer_matches = scalar(@position_matches);
-    my $primer_base_percent = ($total_primer_matches / $total_regions) * 100;
-    
-    if ($primer_base_percent < $min_match_percent) {
-      # Besoin d'une base dégénérée / Need a degenerate base
+  # Si la couverture brute est déjà suffisante, on évite l'optimisation dégénérée (Phase 3)
+  # mais on passe quand même par la Phase 4 pour évaluer la tolérance aux mismatches réels
+  # If raw coverage is sufficient, skip degeneracy optimization (Phase 3)
+  # but proceed to Phase 4 to compute actual mismatch tolerance.
+  if ($perfect_match_percent >= $min_primer_coverage) {
+      # Skip Phase 3
+  } else {
+      # ========================================================================
+      # PHASE 3: ANALYSE POSITION PAR POSITION (Avec contraintes de dégénérescence) / PHASE 3: POSITION BY POSITION ANALYSIS (With degeneracy constraints)
+      # ========================================================================
       
-      # Vérifier les limites de dégénérescence avant de générer le code / Check degeneracy limits before generating code
-      $degen_total++;
-      $degen_consec++;
+      my @position_compatible_seqs = ();
+      my $degen_total = 0;
+      my $degen_consec = 0;
+      my $degen_3p = 0;
       
-      if ($pos_offset >= $three_prime_start_idx && $pos_offset <= $three_prime_end_idx) {
-        $degen_3p++;
+      $three_prime_start_idx = $length - $zone_size;
+      $three_prime_start_idx = 0 if $three_prime_start_idx < 0;
+      $three_prime_end_idx = $length - 1;
+      
+      # Initialiser tracking
+      for my $pos_offset (0 .. $length - 1) {
+        $position_compatible_seqs[$pos_offset] = [ map { $_->{seq_idx} } @perfect_matches ];
       }
       
-      if ($degen_total > $max_total_degen || 
-          $degen_consec > $max_consec_degen || 
-          $degen_3p > $max_3p_degen) {
-        return ("", $perfect_match_percent, 0, []); # Limite dépassée, amorce rejetée mais on retourne la couverture réelle
-      }
-      
-      # FILTRE BRUIT (min_base_freq)
-      my $min_count_noise = $total_regions * $min_base_freq;
-      my %significant_bases = ();
-      $significant_bases{$primer_base} = 1;
-      
-      foreach my $b (keys %base_counts) {
-          if ($base_counts{$b} >= $min_count_noise) {
-              $significant_bases{$b} = 1;
+      for my $pos_offset (0 .. $length - 1) {
+        my $primer_base = substr($candidate_primer_uc, $pos_offset, 1);
+        my %base_counts = ();
+        my @position_matches = @{$position_compatible_seqs[$pos_offset]};
+        
+        for my $target (@non_matches) {
+          my $target_base = substr($target->{region}, $pos_offset, 1);
+          $base_counts{$target_base}++;
+          if ($target_base eq $primer_base) {
+            push @position_matches, $target->{seq_idx};
           }
-      }
-      my @all_bases = keys %significant_bases;
-      my $iupac_code = generateIUPACCode(\@all_bases);
-      
-      if ($iupac_code eq 'N') {
-        # Trop de variation, pas de modif possible fiable
-        return ("", $perfect_match_percent, 0, []);
-      }
-      
-      my @iupac_matches = @{$position_compatible_seqs[$pos_offset]};
-      for my $target (@non_matches) {
-        my $target_base = substr($target->{region}, $pos_offset, 1);
-        if (isIUPACCompatible($target_base, $iupac_code)) {
-          push @iupac_matches, $target->{seq_idx} unless grep { $_ == $target->{seq_idx} } @iupac_matches;
+        }
+        
+        my $primer_base_count = $base_counts{$primer_base} || 0;
+        my $total_primer_matches = scalar(@position_matches);
+        my $primer_base_percent = ($total_primer_matches / $total_regions) * 100;
+        
+        if ($primer_base_percent < $min_match_percent) {
+          # Besoin d'une base dégénérée / Need a degenerate base
+          
+          # Vérifier les limites de dégénérescence avant de générer le code / Check degeneracy limits before generating code
+          $degen_total++;
+          $degen_consec++;
+          
+          if ($pos_offset >= $three_prime_start_idx && $pos_offset <= $three_prime_end_idx) {
+            $degen_3p++;
+          }
+          
+          if ($degen_total > $max_total_degen || 
+              $degen_consec > $max_consec_degen || 
+              $degen_3p > $max_3p_degen) {
+            # Limite de dégénérescence dépassée, on réinitialise l'amorce à sa forme brute et on arrête l'optimisation
+            $optimized_primer = $candidate_primer_uc;
+            $has_modifications = 0;
+            last;
+          }
+          
+          # FILTRE BRUIT (min_base_freq)
+          my $min_count_noise = $total_regions * $min_base_freq;
+          my %significant_bases = ();
+          $significant_bases{$primer_base} = 1;
+          
+          foreach my $b (keys %base_counts) {
+              if ($base_counts{$b} >= $min_count_noise) {
+                  $significant_bases{$b} = 1;
+              }
+          }
+          my @all_bases = keys %significant_bases;
+          my $iupac_code = generateIUPACCode(\@all_bases);
+          
+          if ($iupac_code eq 'N') {
+            # Trop de variation, pas de modif possible fiable
+            $optimized_primer = $candidate_primer_uc;
+            $has_modifications = 0;
+            last;
+          }
+          
+          my @iupac_matches = @{$position_compatible_seqs[$pos_offset]};
+          for my $target (@non_matches) {
+            my $target_base = substr($target->{region}, $pos_offset, 1);
+            if (isIUPACCompatible($target_base, $iupac_code)) {
+              push @iupac_matches, $target->{seq_idx} unless grep { $_ == $target->{seq_idx} } @iupac_matches;
+            }
+          }
+          
+          my $iupac_percent = (scalar(@iupac_matches) / $total_regions) * 100;
+          
+          if ($iupac_percent < $min_iupac_percent) {
+            $optimized_primer = $candidate_primer_uc;
+            $has_modifications = 0;
+            last;
+          }
+          
+          substr($optimized_primer, $pos_offset, 1) = $iupac_code;
+          $position_compatible_seqs[$pos_offset] = \@iupac_matches;
+          $has_modifications = 1;
+        } else {
+          # Pas de dégénérescence à cette position / No degeneracy at this position
+          $degen_consec = 0;
+          $position_compatible_seqs[$pos_offset] = \@position_matches;
         }
       }
-      
-      my $iupac_percent = (scalar(@iupac_matches) / $total_regions) * 100;
-      
-      if ($iupac_percent < $min_iupac_percent) {
-        return ("", $perfect_match_percent, 0, []);
-      }
-      
-      substr($optimized_primer, $pos_offset, 1) = $iupac_code;
-      $position_compatible_seqs[$pos_offset] = \@iupac_matches;
-      $has_modifications = 1;
-    } else {
-      # Pas de dégénérescence à cette position / No degeneracy at this position
-      $degen_consec = 0;
-      $position_compatible_seqs[$pos_offset] = \@position_matches;
-    }
   }
   
   # ========================================================================

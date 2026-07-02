@@ -1201,3 +1201,25 @@ La validation diagnostique d'un assay LAMP exige le strict respect de la sensibi
 **Impact attendu** :
 Le fichier de sortie de référence `.primers` ne contient désormais **strictement que des signatures validées** ayant une couverture supérieure ou égale au seuil de couverture requis par l'utilisateur (ex: 70%). Les signatures sous le seuil restent listées dans `.all_signatures` avec la mention `REJETEE` à des fins de diagnostic et de traçabilité.
 
+
+---
+
+### [2026-07-02] Bug Fix : Bypass de l'Early Exit dans checkPrimerMismatchTolerance pour la tolérance aux mismatches
+
+**Date/Étape** : 2026-07-02 — Correction du court-circuit de l'Early Exit (Phase 2b) pour assurer l'évaluation de la tolérance aux mismatches sur toutes les amorces.
+
+**Fichiers impactés** :
+- [lib/LLNL/LAVA/Validator.pm](file:///Users/cheikhtalibouya/Documents/lava/Nouveau%20dossier%20lava/lava-dna-master/lib/LLNL/LAVA/Validator.pm)
+
+**Nature du changement** : [Thermodynamique / Algorithmique / Bug Fix]
+
+**Explication technique** :
+1. **Court-circuit identifié** : Dans la Phase 2b de la validation individuelle des candidats (`checkPrimerMismatchTolerance`), si le pourcentage de séquences cibles matchant parfaitement (sans erreur) l'amorce brute était supérieur ou égal au seuil de couverture minimale exigé par le pipeline (`min_primer_coverage`, ex: 70%), la fonction effectuait un retour immédiat (`return`).
+2. **Absence de tolérance** : Ce retour prématuré renvoyait uniquement la liste des séquences cibles compatibles à 100%, sans jamais évaluer la tolérance aux mismatches configurée par l'utilisateur (Phase 4). Par conséquent, les amorces ayant une couverture brute naturellement élevée (comme FLOOP, BLOOP, F2, B3) ne voyaient pas leur couverture augmenter pour inclure les cibles présentant 1 ou 2 mutations tolérées en 5' (restant bloquées aux valeurs strictes à 0 mismatch). À l'inverse, les amorces ayant une mauvaise couverture brute passaient le filtre et bénéficiaient de la tolérance de mismatch.
+3. **Correctif appliqué** : L'early exit a été modifié pour contourner uniquement l'optimisation par bases dégénérées IUPAC (Phase 3) lorsqu'elle n'est pas nécessaire, tout en forçant le passage systématique par l'évaluation des mismatches (Phase 4). L'amorce conserve sa séquence brute mais voit sa liste de séquences compatibles (`compatible_sequence_ids`) augmentée de toutes les séquences compatibles réelles sous la tolérance $K$ configurée (ex: 2 mismatches).
+
+**Justification biologique** :
+Les réactions d'amplification isotherme (LAMP) ou PCR tolèrent couramment de légers mésappariements thermodynamiques (mismatches) en zone 5' d'hybridation (en dehors de l'extrémité 3' critique d'initiation de la polymérase à 65°C). Si l'on n'évalue pas cette tolérance sur les amorces ayant une bonne couverture brute de départ, la liste de leurs séquences compatibles reste sous-estimée. Lors de la combinatoire finale, le calcul d'intersection universelle élimine ces séquences cibles pour la signature globale, ce qui sous-évalue artificiellement la couverture diagnostique théorique des assays conçus sur des populations virales hétérogènes (ex: Dengue, Fièvre Jaune, Rotavirus).
+
+**Impact attendu** :
+Une évaluation exacte et cohérente de la tolérance aux mismatches pour toutes les amorces du set LAMP (Inner, Middle, Outer, et Loops). Les taux de couverture individuelle et globale des signatures générées reflètent désormais fidèlement les contraintes thermodynamiques configurées, augmentant ainsi de manière significative la quantité de signatures validées trouvées sur des cibles à forte diversité génomique.
