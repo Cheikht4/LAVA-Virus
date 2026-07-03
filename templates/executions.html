@@ -40,6 +40,10 @@
                                     <i class="fas fa-spinner fa-spin me-1"></i>{{ 'status_running'|t }}
                                 {% elif execution.status == 'completed' %}
                                     <i class="fas fa-check-circle me-1"></i>{{ 'status_completed'|t }}
+                                {% elif execution.status == 'completed_no_results' %}
+                                    <i class="fas fa-exclamation-circle me-1"></i>{{ 'status_completed_no_results'|t }}
+                                {% elif execution.status == 'completed_unknown' %}
+                                    <i class="fas fa-info-circle me-1"></i>{{ 'status_completed_unknown'|t }}
                                 {% elif execution.status == 'error' %}
                                     <i class="fas fa-times me-1"></i>{{ 'status_error'|t }}
                                 {% elif execution.status == 'stopped' %}
@@ -178,6 +182,16 @@ if (runningExecutions.length > 0) {
 
 .badge-status-completed {
     background-color: #28a745 !important;
+    color: #fff !important;
+}
+
+.badge-status-completed_no_results {
+    background-color: #6c757d !important;
+    color: #fff !important;
+}
+
+.badge-status-completed_unknown {
+    background-color: #17a2b8 !important;
     color: #fff !important;
 }
 

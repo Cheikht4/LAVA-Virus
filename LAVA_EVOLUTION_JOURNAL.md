@@ -1247,3 +1247,29 @@ Dans la cinétique moléculaire d'amplification d'une réaction isotherme LAMP, 
 
 **Impact attendu** :
 Une réduction drastique et immédiate des scores de pénalité pour les signatures d'amorces d'amplicons courts et optimaux (chute des scores de Spc de >200 à 0, ne laissant que la pénalité thermodynamique pure de Primer3 ~15). Ces signatures hautement performantes seront désormais classées en tête par le pipeline de LAVA.
+
+---
+
+### [2026-07-03] Amélioration de la Précision du Statut d'Exécution et Remontée Significative des Erreurs
+
+**Date/Étape** : 2026-07-03 - Distinction claire du statut "0 signature trouvée" et remontée intelligente des lignes d'erreurs Perl dans l'interface Web.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `lava_stem_primer.pl`
+- `templates/monitor.html`
+- `templates/executions.html`
+
+**Nature du changement** : [Interface / UX / Reporting]
+
+**Explication technique** :
+1. **Harmonisation des logs Perl** : Ajout dans `lava_stem_primer.pl` de la ligne standard `After reduction: N final signatures` émise juste après la réduction par chevauchement, garantissant une cohérence parfaite avec `lava_loop_primer.pl`.
+2. **Parsing par expression régulière** : Modification de la logique de fin de run dans `lava_flask_app.py` pour extraire dynamiquement le nombre réel de signatures via l'expression régulière `r'after reduction:\s*(\d+)\s*final signatures'`.
+3. **Statut différencié et suppression du faux succès** : Si le nombre de signatures $N = 0$, l'application ne déclare plus un statut `completed` trompeur, mais attribue le statut spécifique `completed_no_results`. L'interface ne présente plus d'icône de validation verte ni d'affirmation de succès basée sur la simple présence de fichiers de logs ou de paramètres bruts.
+4. **Remontée significative des erreurs Perl** : En cas de code de retour non nul, le serveur analyse les logs en ordre inverse pour extraire la dernière ligne d'erreur significative (marquée par `error`, `died`, `can't`, etc.) et la remonte directement dans le message utilisateur.
+
+**Justification biologique** :
+Lors du design d'amorces LAMP sur des alignements viraux très divergents ou avec des contraintes thermodynamiques et spatiales strictes, il est fréquent qu'aucune combinaison ne satisfasse l'ensemble des critères. Il est essentiel pour le bioinformaticien d'être averti immédiatement et sans ambiguïté visuelle que 0 candidat n'a survécu aux filtres, afin d'ajuster ses paramètres de tolérance sans perdre de temps à télécharger des fichiers de résultats vides.
+
+**Impact attendu** :
+Une clarté accrue dans le suivi des exécutions Web. Fin des faux messages de succès lorsque 0 signature est produite, et affichage explicite de la cause d'échec directement dans l'interface sans nécessiter l'ouverture manuelle des fichiers de logs bruts.

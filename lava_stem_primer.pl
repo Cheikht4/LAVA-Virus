@@ -2284,6 +2284,10 @@ sub getOligosWithMismatchTolerance {
       "resolve_overlap_by" => $resolveOverlapBy,
     });
 
+  print "After reduction: " .
+    scalar(@{$possibleSignatures_r}) .
+    " final signatures\n";
+
   # Sort signatures by Coverage (Desc) -> Degeneracy (Asc) -> Penalty (Asc)
   my @possibleSignatures = 
     map {$_->[0]}

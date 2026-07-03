@@ -15,6 +15,7 @@ import threading
 from jinja2 import pass_context
 from werkzeug.utils import secure_filename
 import json
+import re
 
 
 # Dictionnaire de traductions
@@ -169,6 +170,8 @@ TRANSLATIONS = {
         'refreshing': 'Actualisation...',
         'status_running': 'En cours',
         'status_completed': 'Terminé',
+        'status_completed_no_results': 'Terminé (0 signature)',
+        'status_completed_unknown': 'Terminé (?)',
         'status_error': 'Erreur',
         'status_stopped': 'Arrêté',
         'status_starting': 'Démarrage',
@@ -324,6 +327,8 @@ TRANSLATIONS = {
         'refreshing': 'Refreshing...',
         'status_running': 'Running',
         'status_completed': 'Completed',
+        'status_completed_no_results': 'Completed (0 signatures)',
+        'status_completed_unknown': 'Completed (?)',
         'status_error': 'Error',
         'status_stopped': 'Stopped',
         'status_starting': 'Starting',
@@ -947,7 +952,8 @@ def execute_lava_background(execution_id, script_type, input_file, output_name, 
         running_executions[execution_id]['end_time'] = datetime.now()
         
         # Analyser les logs pour déterminer le vrai statut
-        all_logs_text = '\n'.join(output_lines).lower()
+        all_logs_raw = '\n'.join(output_lines)
+        all_logs_text = all_logs_raw.lower()
         
         if return_code == 0:
             # Chercher TOUS les fichiers de résultats générés
@@ -969,24 +975,44 @@ def execute_lava_background(execution_id, script_type, input_file, output_name, 
             # Trier par nom pour un affichage ordonné
             result_files.sort()
             
-            # Analyser les logs pour des messages spécifiques
-            if 'exiting normally' in all_logs_text or 'completed successfully' in all_logs_text:
-                if result_files:
+            # Chercher le nombre de signatures trouvées dans les logs
+            # Format attendu : "After reduction: N final signatures"
+            sig_matches = re.findall(r'after reduction:\s*(\d+)\s*final signatures', all_logs_text, re.IGNORECASE)
+            
+            if sig_matches:
+                sig_count = int(sig_matches[-1])
+                running_executions[execution_id]['signature_count'] = sig_count
+                if sig_count > 0:
                     running_executions[execution_id]['status'] = 'completed'
-                    running_executions[execution_id]['completion_message'] = f"✅ Signatures trouvées et sauvegardées dans {len(result_files)} fichier(s)"
+                    running_executions[execution_id]['completion_message'] = f"✅ {sig_count} signature(s) trouvée(s)"
                 else:
-                    running_executions[execution_id]['status'] = 'completed'
-                    running_executions[execution_id]['completion_message'] = "✅ Exécution terminée avec succès - Aucune signature trouvée avec les paramètres actuels"
+                    running_executions[execution_id]['status'] = 'completed_no_results'
+                    running_executions[execution_id]['completion_message'] = "Exécution terminée : aucune signature trouvée avec les paramètres actuels. Essayez d'assouplir les seuils (couverture, dégénérescence) ou de vérifier l'alignement d'entrée."
             else:
                 running_executions[execution_id]['status'] = 'completed'
-                running_executions[execution_id]['completion_message'] = "✅ Processus terminé"
+                running_executions[execution_id]['completion_message'] = "ℹ️ Exécution terminée : le statut des signatures n'a pas pu être déterminé dans les logs."
             
             running_executions[execution_id]['result_files'] = result_files
         else:
             # Code de retour non-zéro = erreur
             error_msg = f"❌ Erreur d'exécution (code {return_code})"
             
-            # Analyser les logs pour donner plus d'informations
+            # Remonter la dernière ligne significative d'erreur depuis les logs
+            significant_error_line = None
+            error_markers = ['error', 'erreur', 'died', "can't", 'at ', ' line ', 'undefined', 'confess', 'fatal', 'exception']
+            for line in reversed(output_lines):
+                line_clean = line.strip()
+                if not line_clean:
+                    continue
+                line_lower = line_clean.lower()
+                if any(marker in line_lower for marker in error_markers):
+                    significant_error_line = line_clean
+                    break
+            
+            if significant_error_line:
+                error_msg += f"\nDétail : {significant_error_line}"
+            
+            # Analyser les logs pour donner plus d'informations et suggestions
             if 'out of memory' in all_logs_text or 'memory' in all_logs_text:
                 error_msg += "\n💡 Suggestion: Essayez avec un fichier plus petit ou des paramètres moins stricts"
             elif 'no such file' in all_logs_text:

@@ -264,6 +264,7 @@ const i18n = {
     download_selected: "{{ 'download_selected'|t }}",
     status_running: "{{ 'status_running'|t }}",
     status_completed: "{{ 'status_completed'|t }}",
+    status_completed_no_results: "{{ 'status_completed_no_results'|t }}",
     status_error: "{{ 'status_error'|t }}",
     status_stopped: "{{ 'status_stopped'|t }}",
     status_starting: "{{ 'status_starting'|t }}"
@@ -344,6 +345,9 @@ function updateStatusBadge(status) {
             break;
         case 'completed':
             badge.classList.add('bg-success');
+            break;
+        case 'completed_no_results':
+            badge.classList.add('bg-secondary');
             break;
         case 'error':
             badge.classList.add('bg-danger');
@@ -468,8 +472,16 @@ function refreshStatus() {
             }
             
             // Afficher le message de completion si présent
-            if (data.completion_message && data.status === 'completed') {
-                document.getElementById('completion-container').style.display = 'block';
+            if (data.completion_message && (data.status === 'completed' || data.status === 'completed_no_results' || data.status === 'completed_unknown')) {
+                const compContainer = document.getElementById('completion-container');
+                compContainer.style.display = 'block';
+                if (data.status === 'completed_no_results') {
+                    compContainer.className = 'alert alert-warning';
+                } else if (data.status === 'completed_unknown') {
+                    compContainer.className = 'alert alert-info';
+                } else {
+                    compContainer.className = 'alert alert-success';
+                }
                 document.getElementById('completion-message').textContent = data.completion_message;
             }
             
@@ -492,6 +504,14 @@ function refreshStatus() {
             // Afficher les résultats si disponibles
             if (data.result_files && data.result_files.length > 0) {
                 document.getElementById('results-container').style.display = 'block';
+                const resultsCardHeader = document.querySelector('#results-container .card-header');
+                if (resultsCardHeader) {
+                    if (data.status === 'completed_no_results') {
+                        resultsCardHeader.className = 'card-header bg-secondary text-white';
+                    } else {
+                        resultsCardHeader.className = 'card-header bg-success text-white';
+                    }
+                }
                 const resultsList = document.getElementById('results-list');
                 const filesCountBadge = document.getElementById('files-count-badge');
                 
