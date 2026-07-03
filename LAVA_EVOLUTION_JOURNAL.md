@@ -1285,8 +1285,6 @@ Une clarté accrue dans le suivi des exécutions Web. Fin des faux messages de s
 - `lava_stem_primer.pl`
 - `lava_flask_app.py`
 
-**Nature du changement** : [Algorithmique / Validation / Interface]
-
 **Explication technique** :
 1. **Validation BioPerl et vérification brute** : Ajout d'une double vérification stricte immédiatement après le chargement de l'alignement (`next_aln()`) dans `lava_loop_primer.pl` et `lava_stem_primer.pl`. Le moteur vérifie d'une part la présence d'au moins 2 séquences et l'état `is_flush()`, et d'autre part analyse les longueurs brutes des séquences dans le fichier FASTA d'origine afin de déjouer le padding automatique silencieux (ajout de tirets en fin de séquence) effectué par `Bio::AlignIO::fasta`.
 2. **Code d'erreur dédié et marqueur stable** : En cas de séquences de longueurs inégales ou d'alignement invalide, le moteur Perl interrompt immédiatement l'exécution avec le code de sortie dédié `2` et émet le marqueur explicite `ERROR: INPUT_NOT_ALIGNED` sur la sortie d'erreur.
@@ -1295,6 +1293,7 @@ Une clarté accrue dans le suivi des exécutions Web. Fin des faux messages de s
 **Justification biologique** :
 La conception d'amorces LAMP consensuelles repose sur le calcul de l'entropie de Shannon par colonne de position dans un alignement multiple de séquences (MSA). L'injection de séquences brutes non alignées (de longueurs différentes) fausse totalement le repère des coordonnées spatiales : des homologues fonctionnels ne se trouvent plus sur la même colonne d'alignement, ce qui génère des calculs d'entropie aberrants et conduit soit à des échecs silencieux, soit à des amorces inopérantes in vitro. Garantir que l'entrée est un véritable alignement multiple avant tout calcul combinatoire protège la validité scientifique des amorces produites.
 
+**Impact attendu** :
 Protection complète de l'utilisateur contre l'envoi accidentel de fichiers FASTA non alignés ou de séquences isolées. L'arrêt est instantané, explicite, et l'interface guide clairement l le chercheur vers l'étape de pré-traitement (alignement multiple) nécessaire.
 
 ---
@@ -1317,3 +1316,25 @@ Dans de nombreux protocoles de diagnostic moléculaire, le chercheur souhaite co
 
 **Impact attendu** :
 Restauration immédiate de la capacité de LAVA à concevoir des amorces LAMP (classique ou enrichi) sur des séquences uniques, sans déclencher d'alerte de non-alignement.
+
+---
+
+### [2026-07-03] Internationalisation Complète du Monitoring et des Messages d'Exécution
+
+**Date/Étape** : 2026-07-03 - Traduction complète et dynamique de la surveillance et des diagnostics d'erreur.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `templates/monitor.html`
+- `templates/executions.html`
+
+**Nature du changement** : [Architecture / UI Fix]
+
+**Explication technique** :
+Remplacement des chaînes codées en dur en français dans le thread d'arrière-plan `execute_lava_background` par des appels dynamiques au dictionnaire `TRANSLATIONS` indexés par `running_executions[execution_id]['lang']`. Cela garantit que les messages de fin (`completion_message`) ou d'erreur s'affichent dans la langue active de la session. Enrichissement bilingue de la fonction `translate_error_to_user_friendly(error_message, lang)`. Remplacement de tous les libellés de surveillance et des compteurs de progression dans `monitor.html` et `executions.html` (HTML et JS) par des filtres Jinja `|t`.
+
+**Justification biologique** :
+Dans un contexte international de surveillance épidémiologique, la clarté et l'accessibilité linguistique des messages de retour (détection de signatures, alertes sur les seuils de couverture, erreurs de format FASTA ou d'encodage) sont cruciales pour éviter les interprétations erronées et permettre un ajustement rapide des paramètres géométriques et thermodynamiques.
+
+**Impact attendu** :
+Une bascule instantanée et complète en anglais ou en français de la page de suivi en temps réel, des alertes de fin d'exécution et de la liste des analyses.
