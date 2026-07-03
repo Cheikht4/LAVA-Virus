@@ -1077,24 +1077,23 @@ def execute_lava():
         
     # S'assurer que session['params'] existe
     if 'params' not in session:
-        session['params'] = _get_default_params(script_type)
+        session['params'] = get_default_params()
     else:
         # Si le type de script a changé, on réinitialise ou on garde les paramètres communs
         if session['params'].get('script_type') != script_type:
-            session['params'] = _get_default_params(script_type)
+            session['params'] = get_default_params()
         else:
             # S'assurer que tous les paramètres existent
-            defaults = _get_default_params(script_type)
+            defaults = get_default_params()
             for k, v in defaults.items():
                 if k not in session['params']:
                     session['params'][k] = v
                     
     session['params']['script_type'] = script_type
     if 'lamp_mode' in request.form:
-        session['params']['lamp_mode'] = request.form['lamp_mode']
+        _apply_lamp_mode(session['params'], request.form['lamp_mode'], script_type)
     elif 'lamp_mode' not in session['params']:
-        session['params']['lamp_mode'] = _get_default_lamp_mode(
-                        session['params']['script_type'])
+        session['params']['lamp_mode'] = 'classic'
     
     for key, value in request.form.items():
         if key not in ['script_type', 'lamp_mode', 'output_name']:
