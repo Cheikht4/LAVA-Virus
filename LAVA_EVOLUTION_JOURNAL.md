@@ -1285,8 +1285,6 @@ Une clarté accrue dans le suivi des exécutions Web. Fin des faux messages de s
 - `lava_stem_primer.pl`
 - `lava_flask_app.py`
 
-**Nature du changement** : [Algorithmique / Validation / Interface]
-
 **Explication technique** :
 1. **Validation BioPerl et vérification brute** : Ajout d'une double vérification stricte immédiatement après le chargement de l'alignement (`next_aln()`) dans `lava_loop_primer.pl` et `lava_stem_primer.pl`. Le moteur vérifie d'une part la présence d'au moins 2 séquences et l'état `is_flush()`, et d'autre part analyse les longueurs brutes des séquences dans le fichier FASTA d'origine afin de déjouer le padding automatique silencieux (ajout de tirets en fin de séquence) effectué par `Bio::AlignIO::fasta`.
 2. **Code d'erreur dédié et marqueur stable** : En cas de séquences de longueurs inégales ou d'alignement invalide, le moteur Perl interrompt immédiatement l'exécution avec le code de sortie dédié `2` et émet le marqueur explicite `ERROR: INPUT_NOT_ALIGNED` sur la sortie d'erreur.
@@ -1295,6 +1293,7 @@ Une clarté accrue dans le suivi des exécutions Web. Fin des faux messages de s
 **Justification biologique** :
 La conception d'amorces LAMP consensuelles repose sur le calcul de l'entropie de Shannon par colonne de position dans un alignement multiple de séquences (MSA). L'injection de séquences brutes non alignées (de longueurs différentes) fausse totalement le repère des coordonnées spatiales : des homologues fonctionnels ne se trouvent plus sur la même colonne d'alignement, ce qui génère des calculs d'entropie aberrants et conduit soit à des échecs silencieux, soit à des amorces inopérantes in vitro. Garantir que l'entrée est un véritable alignement multiple avant tout calcul combinatoire protège la validité scientifique des amorces produites.
 
+**Impact attendu** :
 Protection complète de l'utilisateur contre l'envoi accidentel de fichiers FASTA non alignés ou de séquences isolées. L'arrêt est instantané, explicite, et l'interface guide clairement l le chercheur vers l'étape de pré-traitement (alignement multiple) nécessaire.
 
 ---
@@ -1317,3 +1316,180 @@ Dans de nombreux protocoles de diagnostic moléculaire, le chercheur souhaite co
 
 **Impact attendu** :
 Restauration immédiate de la capacité de LAVA à concevoir des amorces LAMP (classique ou enrichi) sur des séquences uniques, sans déclencher d'alerte de non-alignement.
+
+---
+
+### [2026-07-03] Internationalisation Complète du Monitoring et des Messages d'Exécution
+
+**Date/Étape** : 2026-07-03 - Traduction complète et dynamique de la surveillance et des diagnostics d'erreur.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `templates/monitor.html`
+- `templates/executions.html`
+
+**Nature du changement** : [Architecture / UI Fix]
+
+**Explication technique** :
+Remplacement des chaînes codées en dur en français dans le thread d'arrière-plan `execute_lava_background` par des appels dynamiques au dictionnaire `TRANSLATIONS` indexés par `running_executions[execution_id]['lang']`. Cela garantit que les messages de fin (`completion_message`) ou d'erreur s'affichent dans la langue active de la session. Enrichissement bilingue de la fonction `translate_error_to_user_friendly(error_message, lang)`. Remplacement de tous les libellés de surveillance et des compteurs de progression dans `monitor.html` et `executions.html` (HTML et JS) par des filtres Jinja `|t`.
+
+**Justification biologique** :
+Dans un contexte international de surveillance épidémiologique, la clarté et l'accessibilité linguistique des messages de retour (détection de signatures, alertes sur les seuils de couverture, erreurs de format FASTA ou d'encodage) sont cruciales pour éviter les interprétations erronées et permettre un ajustement rapide des paramètres géométriques et thermodynamiques.
+
+**Impact attendu** :
+Une bascule instantanée et complète en anglais ou en français de la page de suivi en temps réel, des alertes de fin d'exécution et de la liste des analyses.
+
+---
+
+### [2026-07-03] Création du Dépôt Git Autonome de l'Interface Web (LAVA-Web)
+
+**Date/Étape** : 2026-07-03 - Structuration d'un dépôt propre dédié au déploiement de l'interface graphique et à la publication.
+
+**Fichiers impactés** :
+- `lava-interface-public/` (Nouveau dépôt autonome)
+- `README.md`
+- `.gitignore`
+
+**Nature du changement** : [Architecture / Publication]
+
+**Explication technique** :
+Création et initialisation d'un dépôt Git dédié (`lava-interface-public`) en miroir du dépôt moteur (`lava-dna-public` / `LAVA-Virus`). Ce nouveau dépôt regroupe exclusivement l'application web Flask (`lava_flask_app.py`), les templates bilingues (`templates/`), les scripts de production (`deployment/`), ainsi que le sous-ensemble minimal de modules scientifiques Perl requis pour son exécution en production. Tous les fichiers de log, caches Python, fichiers temporaires et archives de travail sont rigoureusement exclus via un `.gitignore` optimisé.
+
+**Justification biologique** :
+Séparer clairement le dépôt de l'interface web prête à l'emploi du dépôt moteur de recherche fondamentale permet de proposer à la communauté scientifique et aux laboratoires cliniques un package web immédiatement déployable sur serveur de diagnostic, sans alourdir le dépôt avec l'historique d'expérimentation ou les scripts de test algorithmique.
+
+**Impact attendu** :
+Disponibilité et publication officielle du package Git public sur GitHub sous le nom `LAVA_Virus-Interface` (https://github.com/Cheikht4/LAVA_Virus-Interface.git), simplifiant drastiquement l'installation et la maintenance de serveurs LAVA dans les instituts de recherche.
+
+---
+
+### [2026-07-05] Publication Officielle du Dépôt LAVA_Virus-Interface
+
+**Date/Étape** : 2026-07-05 - Publication et synchronisation du dépôt autonome de l'interface graphique.
+
+**Fichiers impactés** :
+- `lava-interface-public/` (dépôt public distant)
+
+**Nature du changement** : [Publication / Git]
+
+**Explication technique** :
+Connexion du répertoire local `lava-interface-public` au remote officiel GitHub (`https://github.com/Cheikht4/LAVA_Virus-Interface.git`) via la commande `git remote add origin` et push de la branche `main`. Ce dépôt constitue désormais la référence officielle et autonome pour le déploiement web de LAVA-DNA.
+
+**Justification biologique** :
+Fournir un accès direct et universel au code source propre de l'interface web permet aux laboratoires de référence internationale d'auditer, cloner et déployer l'outil de diagnostic dans leurs propres infrastructures sécurisées.
+
+**Impact attendu** :
+Accessibilité publique immédiate de l'application web bilingue LAVA sur GitHub.
+
+---
+
+### [2026-07-05] Passage de l'Interface Web sous Licence Propriétaire (Autorisation Requise)
+
+**Date/Étape** : 2026-07-05 - Restructuration juridique des droits d'utilisation de l'interface graphique.
+
+**Fichiers impactés** :
+- `LICENSE`
+- `README.md`
+
+**Nature du changement** : [Juridique / Architecture]
+
+**Explication technique** :
+Mise à jour du fichier `LICENSE` pour distinguer clairement 3 parties : (1) Le moteur Perl hérité de LLNL (BSD 3-Clause), (2) Les modules Perl étendus comme `Validator.pm`, `Core.pm`, `PipelineUtils.pm` (BSD 3-Clause), et (3) L'ensemble de l'interface graphique web (`lava_flask_app.py`, `templates/`, `static/`, `deployment/`) qui passe sous **Licence Propriétaire - Tous droits réservés (Cheikh Talibouya)**. Toute utilisation, copie, modification ou déploiement clinique/commercial de l'interface est désormais impérativement soumise à l'autorisation écrite préalable de l'auteur.
+
+**Justification biologique** :
+Alors que les algorithmes de recherche fondamentale en bioinformatique gagnent à rester en open-source pour permettre la vérification par les pairs et la reproductibilité scientifique, l'interface clinique de diagnostic, intégrant les sécurités anti-décalage et la surveillance d'exécution, requiert un contrôle de diffusion strict afin d'éviter l'émergence de clones non certifiés dans un cadre de santé publique.
+
+**Impact attendu** :
+Protection complète de la propriété intellectuelle de l'interface graphique LAVA-DNA, tout en préservant l'ouverture open-source du moteur de calcul bioinformatique sous-jacent.
+
+---
+
+### [2026-07-06] Durcissement de Sécurité : Traversée de Répertoire et Concurrence Atomique
+
+**Date/Étape** : 2026-07-06 - Audit et correction de vulnérabilités sur l'interface web (`lava_flask_app.py`).
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+
+**Nature du changement** : [Sécurité / Architecture]
+
+**Explication technique** :
+1. **Protection contre la traversée de répertoire (`output_name`)** : Nettoyage systématique du paramètre `output_name` issu du formulaire via `secure_filename()` avant toute construction de chemin dans `execute_lava`. Si la chaîne nettoyée est vide (ex: saisie malveillante du type `../../`), le système applique automatiquement la valeur par défaut sécurisée `'lava_result'`.
+2. **Synchronisation atomique des quotas de concurrence** : Introduction d'un verrou global `executions_lock = threading.Lock()`. Dans la route `/execute`, la vérification des quotas (seuils globaux et par utilisateur) et l'insertion de l'exécution dans le dictionnaire `running_executions` avec le statut `'starting'` sont désormais encapsulées dans un unique bloc atomique (`with executions_lock:`), éliminant toute race condition lors de requêtes simultanées.
+
+**Justification biologique** :
+Sur un serveur de diagnostic clinique partagé par plusieurs équipes de recherche, l'intégrité du système de fichiers est primordiale pour éviter l'écrasement ou la fuite de données génomiques sensibles (séquences virales de patients). De plus, le calcul d'amorces LAMP étant intensif en ressources CPU, garantir l'inviolabilité des quotas d'exécution empêche toute surcharge accidentelle ou déni de service (DoS) qui paralyserait les analyses en cours.
+
+**Impact attendu** :
+Confinement absolu de tous les fichiers de résultats dans le répertoire dédié (`results/`) et respect strict des limites de calcul simultané en environnement multi-utilisateurs.
+
+---
+
+### [2026-07-06] Durcissement de Sécurité (Fin d'Audit) : Masquage des Traces en Production et Purge du Rate Limiter
+
+**Date/Étape** : 2026-07-06 - Finalisation de l'audit de sécurité et durcissement de l'interface web (`lava_flask_app.py`).
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+
+**Nature du changement** : [Sécurité / Architecture / Bug Fix]
+
+**Explication technique** :
+1. **Masquage conditionnel de la trace technique (`technical_error`)** : Dans la route `/api/status`, l'ajout du champ `technical_error` (trace brute Python/Perl) au flux JSON renvoyé au client est désormais strictement conditionné au mode de développement (`os.environ.get('FLASK_ENV') != 'production'`). En environnement de production, seule l'explication traduite et vulgarisée (`error`) est transmise au client web, interdisant toute fuite d'informations sur l'architecture interne du serveur ou les chemins de fichiers.
+2. **Purge active de la mémoire du Rate Limiter** : Au sein de la boucle de nettoyage asynchrone (`background_data_cleanup`), un mécanisme de purge des adresses IP inactives a été ajouté. Toutes les heures, les horodatages des requêtes dans `ip_request_history` sont filtrés sur une fenêtre glissante de 3600 secondes ; si la liste d'une IP devient vide, sa clé est définitivement supprimée du dictionnaire `defaultdict(list)`, éliminant toute accumulation passive et fuite mémoire sur les serveurs de longue durée.
+
+**Justification biologique** :
+Dans un contexte de diagnostic hospitalier ou de veille épidémiologique en production, l'exposition des traces d'erreurs brutes (contenant des chemins d'accès serveur, des structures de répertoires ou des commandes système) représente un vecteur d'attaque d'ingénierie inverse. Leur masquage garantit l'inviolabilité de la plateforme LAVA-DNA tout en conservant une remontée d'erreur claire pour les virologues. De plus, la purge mémoire préserve la stabilité opérationnelle des serveurs lors des campagnes massives de screening sur plusieurs mois.
+
+**Impact attendu** :
+Sécurité maximale des échanges API en environnement de production (aucune fuite technique) et stabilité mémoire garantie sur le long terme sans redémarrage de l'application web.
+
+---
+
+### [2026-07-06] Harmonisation de l'Identité Web : Renommage en LAVA_Virus et Simplification
+
+**Date/Étape** : 2026-07-06 - Mise à jour de l'identité visuelle et textuelle de l'interface graphique.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `launch_lava_smart_kill.py`
+- `templates/index.html`
+- `templates/base.html`
+- `templates/login.html`
+- `templates/monitor.html`
+- `templates/executions.html`
+
+**Nature du changement** : [Architecture / Interface]
+
+**Explication technique** :
+Remplacement systématique de l'appellation "LAVA-DNA" par la marque officielle **LAVA_Virus** sur l'ensemble de l'application web (titres de pages HTML, barre de navigation, dictionnaire bilingue de traduction FR/EN et logs de démarrage). Parallèlement, le sous-titre verbeux "LAMP primer design with LAVA - Stable web interface" a été épuré pour devenir simplement **LAMP primer design**, offrant une interface web à la fois plus directe, moderne et centrée sur sa fonction algorithmique essentielle.
+
+**Justification biologique** :
+L'outil LAVA étant désormais spécialisé dans le ciblage de génomes viraux hautement variables (séquences consensus et alignements de variants), l'appellation LAVA_Virus reflète avec exactitude le domaine d'application clinique et épidémiologique de la plateforme, évitant toute confusion avec des outils généralistes de PCR sur ADN génomique hôte.
+
+**Impact attendu** :
+Clarté immédiate pour les virologues quant à la vocation virale de l'outil et interface graphique épurée.
+
+---
+
+### [2026-07-06] Précision Granulaire du Suivi de Progression par Type d'Amorce LAMP
+
+**Date/Étape** : 2026-07-06 - Spécification détaillée des étapes de validation dans les messages de progression (Outer, Middle, Inner, Loop, Stem).
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/PipelineUtils.pm`
+- `lava_stem_primer.pl`
+- `lava_loop_primer.pl`
+
+**Nature du changement** : [Architecture / Interface / Reporting]
+
+**Explication technique** :
+1. **Ajout d'un paramètre de label dynamique** : Modification des routines de validation `getOligosWithMismatchTolerance` (dans les scripts Perl) et `buildNativeReversePool` (dans `PipelineUtils.pm`) afin d'accepter un argument supplémentaire `$label` définissant le type d'amorce en cours de traitement.
+2. **Émission spécifique dans LAVA-PROGRESS** : Au lieu d'émettre des messages génériques en dur du type `[LAVA-PROGRESS] Validation Forward` ou `Reverse Validation`, le moteur Perl injecte désormais le nom précis et la nomenclature LAMP officielle dans le flux de progression STDOUT : `Outer Forward (F3)`, `Outer Reverse (B3)`, `Middle Forward (F2)`, `Middle Reverse (B2)`, `Inner Forward (F1c)`, `Inner Reverse (B1c)`, `Loop Back (BLOOP)`, `Loop Forward (FLOOP)`, `Stem Back (BSTEM)` et `Stem Forward (FSTEM)`.
+3. **Compatibilité transparente avec l'interface Web** : Le contrôleur Flask (`lava_flask_app.py`), qui intercepte le premier champ avant le séparateur `|` des lignes `[LAVA-PROGRESS]`, affiche automatiquement et en temps réel le libellé granulaire sur l'interface utilisateur de suivi.
+
+**Justification biologique** :
+Dans le design d'amorces LAMP enrichi ou classique sur des génomes viraux complexes, chaque catégorie d'amorce (F3/B3, F2/B2, F1c/B1c, Loops ou Stems) obéit à des contraintes thermodynamiques, des tailles et des localisations génomiques distinctes. Un échec de validation ou un temps de calcul prolongé sur une étape spécifique (par exemple les amorces Inner F1c/B1c, très longues et soumises à des structures secondaires) exige que le bioinformaticien sache instantanément quelle population d'oligonucléotides est en cours de criblage ou de rejet, sans se contenter d'une distinction binaire Forward/Reverse.
+
+**Impact attendu** :
+Une lisibilité et une transparence exceptionnelles du suivi en temps réel sur l'interface Web LAVA_Virus : le chercheur visualise précisément la progression de la validation étape par étape et par type d'amorce LAMP.
