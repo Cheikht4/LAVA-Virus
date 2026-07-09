@@ -1493,3 +1493,26 @@ Dans le design d'amorces LAMP enrichi ou classique sur des génomes viraux compl
 
 **Impact attendu** :
 Une lisibilité et une transparence exceptionnelles du suivi en temps réel sur l'interface Web LAVA_Virus : le chercheur visualise précisément la progression de la validation étape par étape et par type d'amorce LAMP.
+
+---
+
+### [2026-07-09] Fonctionnalité d'Importation et Réplication Automatique des Paramètres d'Exécution
+
+**Date/Étape** : 2026-07-09 - Import de fichier de paramètres (`.params.txt` ou `.json`) pour faciliter la reproductibilité expérimentale.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `templates/index.html`
+
+**Nature du changement** : [Architecture / Interface / UX]
+
+**Explication technique** :
+1. **Création du point d'entrée d'importation (`/upload_params_file`)** : Implémentation d'une nouvelle route Flask capable de recevoir et d'analyser les fichiers de paramètres générés lors d'exécutions précédentes (`.params.txt` ou format `.json`).
+2. **Analyseur de format LAVA multi-format** : Le parseur extrait dynamiquement le type de script (`STEM` ou `LOOP`), le mode de design (`classic` ou `enriched`), ainsi que l'intégralité des drapeaux Perl (ex: `--primer_min_match_percent: 85.0`). Il mappe chaque paramètre sur sa variable de session Python adéquate en convertissant automatiquement les types de données (`int`, `float`, `bool`, `str`).
+3. **Intégration ergonomique dans l'IHM** : Ajout de deux boutons d'action rapide "Importer un fichier de paramètres" (dans l'en-tête de la section de configuration et à côté du bouton de sauvegarde) reliés à une fonction AJAX en JavaScript. Dès la sélection du fichier, le formulaire est mis à jour et rechargé instantanément pour refléter avec exactitude les conditions expérimentales importées.
+
+**Justification biologique** :
+En recherche clinique et épidémiologique, la comparaison de performance des amorces LAMP sur différentes souches virales exige une stricte invariance des conditions thermodynamiques (températures de fusion $T_m$, concentrations salines et dNTP, tolérance aux mésappariements, fenêtres de réduction spatiale). Permettre de recharger directement un fichier `.params.txt` issu d'un run réussi évite les erreurs de saisie manuelle et garantit la reproductibilité parfaite des protocoles in silico d'un isolat à l'autre ou entre différents collaborateurs du laboratoire.
+
+**Impact attendu** :
+Un gain de temps considérable pour l'utilisateur qui peut désormais répliquer ou ajuster des conditions d'expérience complexes en un seul clic via l'import de ses fichiers de paramètres antérieurs.
