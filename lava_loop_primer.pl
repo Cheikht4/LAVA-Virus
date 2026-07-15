@@ -91,6 +91,7 @@ use LLNL::LAVA::PrimerSet::LAMP;
 use LLNL::LAVA::Core qw(generateDistancePenalties calculate_proportional_geometry generateSigmoidPenalty countDegenerateBases);
 use LLNL::LAVA::Validator qw(checkPrimerMismatchTolerance getPrimerTargetedSequences isIUPACCompatible rev_comp generateIUPACCode validateCompleteSignatureSpacing);
 use LLNL::LAVA::PipelineUtils qw(buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths); # buildReversePrimers retiré (DEPRECATED, remplacé par buildNativeReversePool)
+use LLNL::LAVA::ForkManager;
 
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
 # Enable STDOUT autoflush for real-time log streaming via Flask
@@ -278,6 +279,7 @@ sub getOligosWithMismatchTolerance {
     (
       "alignment_fasta=s" => \$options{"alignment_fasta"},
       "output_file=s" => \$options{"output_file"}, 
+      "threads|cpu=s" => \$options{"threads"},
       "signature_max_length=i" => \$options{"signature_max_length"},
       "total_signature_length=i" => \$options{"total_signature_length"},
 
@@ -369,6 +371,7 @@ sub getOligosWithMismatchTolerance {
 
   my %optionDefaults =
     (
+      "threads" => "auto",
       "signature_max_length" => 320,
       "outer_primer_target_length" => 20,
       "outer_primer_min_length" => 18,
@@ -1438,192 +1441,198 @@ sub getOligosWithMismatchTolerance {
   my $_sig_fwd_t0   = time();
   my $_sig_fwd_done = 0;
   my $_sig_fwd_hits = 0;  # Nombre de signatures Forward trouvees / Forward signatures found
-  print STDERR "  Recherche combinatoire Forward: $innerForwardCount amorces F1c...\n";
+  my $pm_fwd = LLNL::LAVA::ForkManager->new($options_r->{"threads"});
+  my $num_fwd_chunks = $pm_fwd->{max_processes} > 1 ? $pm_fwd->{max_processes} * 4 : 1;
+  my $fwd_chunk_size = int(($innerForwardCount + $num_fwd_chunks - 1) / $num_fwd_chunks);
+  $fwd_chunk_size = 1 if $fwd_chunk_size < 1;
 
-  for(my $innerIndex = 0; $innerIndex < $innerForwardCount; $innerIndex++)
-  {
-      # Barre de progression toutes les 50 iterations ou a 100%
-      # Progress bar every 50 iterations or at 100%
-      $_sig_fwd_done = $innerIndex + 1;
-      if ($_sig_fwd_done % 50 == 0 || $_sig_fwd_done == $innerForwardCount) {
-        # Emission progression Flask / Flask progress emission
-        if ($_LAVA_IS_TTY || 1) {  # Toujours emettre pour Flask / Always emit for Flask
-          my $elapsed = time() - $_sig_fwd_t0 + 0.001;
-          my $eta = ($_sig_fwd_done < $innerForwardCount)
-                    ? int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed))
-                    : 0;
-          my $rate = $_sig_fwd_done / $elapsed;
-          printf("[LAVA-PROGRESS] Signatures Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
-                 $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
-        }
+  $pm_fwd->run_on_finish(sub {
+      my ($pid, $exit_code, $id, $exit_signal, $core_dump, $data_ref) = @_;
+      if (defined $data_ref && ref($data_ref) eq 'HASH') {
+          foreach my $idx (keys %{$data_ref->{infos}}) {
+              if (!defined $bestForwardInfos[$idx]) {
+                  $forwardSetCount++;
+              }
+              $bestForwardInfos[$idx] = $data_ref->{infos}->{$idx};
+              $bestForwardPenalties[$idx] = $data_ref->{penalties}->{$idx};
+          }
+          $_sig_fwd_hits += $data_ref->{hits} || 0;
+          $_sig_fwd_done += $data_ref->{done} || 0;
+          if ($_LAVA_IS_TTY || 1) {
+              my $elapsed = time() - $_sig_fwd_t0 + 0.001;
+              my $eta = ($_sig_fwd_done < $innerForwardCount)
+                        ? int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed))
+                        : 0;
+              my $rate = $_sig_fwd_done / $elapsed;
+              printf("[LAVA-PROGRESS] Signatures Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
+                     $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
+          }
       }
-      my $innerInfo = $masterInnerF_r->[$innerIndex];
-      my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerF_data_r->[$innerIndex]};
-      
-      my $bestSetPenalty = 1000000;
-      
-      # 3.1 Calculate Search Bounds for Loop Primer
-      my $searchStartAt = $innerLocation - $signatureMaxLength + $innerLength + 20;
-      $searchStartAt = 0 if $searchStartAt < 0;
-      
-      my $loopEndAt = $innerLocation - 1 - $minPrimerSpacing;
-      $loopEndAt = 0 if $loopEndAt < 0;
-      
-      # Determine Loop List to iterate
-      my $currentLoopList_r = $includeLoopPrimers ? $masterLoopF_r : $masterLoopF_r; # Placeholder logic if false
-      my $currentLoopData_r = $includeLoopPrimers ? $masterLoopF_data_r : $masterLoopF_data_r;
-      my $loopCount = scalar(@{$currentLoopList_r});
-      
-      # If NO loops, we update the placeholder location to be valid (end of range)
-      if (!$includeLoopPrimers) {
-           $currentLoopData_r->[0]->[0] = $loopEndAt + 1; # Dummy valid location
-      }
+  });
 
-      for(my $i = 0; $i < $loopCount; $i++)
+  for (my $chunk_start = 0; $chunk_start < $innerForwardCount; $chunk_start += $fwd_chunk_size) {
+      my $chunk_end = $chunk_start + $fwd_chunk_size - 1;
+      $chunk_end = $innerForwardCount - 1 if $chunk_end >= $innerForwardCount;
+      
+      $pm_fwd->start($chunk_start) and next;
+      
+      my %chunk_infos = ();
+      my %chunk_penalties = ();
+      my $chunk_hits = 0;
+      my $chunk_done = 0;
+      
+      for(my $innerIndex = $chunk_start; $innerIndex <= $chunk_end; $innerIndex++)
       {
-          my $loopInfo = $currentLoopList_r->[$i];
-          my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
+          $chunk_done++;
+          my $innerInfo = $masterInnerF_r->[$innerIndex];
+          my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerF_data_r->[$innerIndex]};
           
-          if ($includeLoopPrimers) {
-              # Fast-Fail: Sorted by location.
-              # If loop is before search window, skip.
-              next if ($loopLocation < $searchStartAt);
-              
-              # Fast-Fail: If loop is beyond search window, STOP.
-              last if ($loopLocation > $loopEndAt);
+          my $bestSetPenalty = 1000000;
+          
+          # 3.1 Calculate Search Bounds for Loop Primer
+          my $searchStartAt = $innerLocation - $signatureMaxLength + $innerLength + 20;
+          $searchStartAt = 0 if $searchStartAt < 0;
+          
+          my $loopEndAt = $innerLocation - 1 - $minPrimerSpacing;
+          $loopEndAt = 0 if $loopEndAt < 0;
+          
+          # Determine Loop List to iterate
+          my $currentLoopList_r = $includeLoopPrimers ? $masterLoopF_r : $masterLoopF_r; # Placeholder logic if false
+          my $currentLoopData_r = $includeLoopPrimers ? $masterLoopF_data_r : $masterLoopF_data_r;
+          my $loopCount = scalar(@{$currentLoopList_r});
+          
+          # If NO loops, we update the placeholder location to be valid (end of range)
+          if (!$includeLoopPrimers) {
+               $currentLoopData_r->[0]->[0] = $loopEndAt + 1; # Dummy valid location
+          }
 
-              # --- DYNAMIC THERMAL FILTER (Inner vs Loop) ---
-              next if (abs($innerTm - $loopTm) > $maxTmDiff);
-          }
-          
-          # 3.2 Calculate Search Bounds for Middle Primer (F2) (Structure: F3-F2-LF-F1c)
-          # Middle (F2) is upstream of Loop.
-          my $middleStartAt = $searchStartAt; # Inherit max range start
-          my $middleEndAt = $loopLocation - $loopLength - $minPrimerSpacing;
-          
-          # Ensure Middle isn't too close to Inner (respecting loop gap or standard gap)
-          if ($includeLoopPrimers) {
-              my $altMiddleEndAt = $innerLocation - ($loopMinGap + 1);
-              $middleEndAt = $altMiddleEndAt if ($altMiddleEndAt < $middleEndAt);
-          } else {
-              my $altMiddleEndAt = $innerLocation - $minPrimerSpacing;
-              $middleEndAt = $altMiddleEndAt if ($altMiddleEndAt < $middleEndAt);
-          }
-          $middleEndAt = 0 if $middleEndAt < 0;
-          
-          my $innerToLoopDistance = $innerLocation - ($loopLocation + 1);
-          
-          my $middleCount = scalar(@{$masterMiddleF_r});
-          for(my $j = 0; $j < $middleCount; $j++)
+          for(my $i = 0; $i < $loopCount; $i++)
           {
-              my $middleInfo = $masterMiddleF_r->[$j];
-              my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleF_data_r->[$j]};
+              my $loopInfo = $currentLoopList_r->[$i];
+              my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
               
-              # Fast-Fail
-              next if ($middleLocation < $middleStartAt);
-              last if ($middleLocation > $middleEndAt);
-              
-              # Validity Checks (Redundant with bounds but safe)
               if ($includeLoopPrimers) {
-                  next if ($middleLocation + $middleLength + $minPrimerSpacing > $loopLocation - $loopLength + 1);
-                  next if ($middleLocation + $middleLength + $loopMinGap > $innerLocation);
-              }
+                  # Fast-Fail: Sorted by location.
+                  next if ($loopLocation < $searchStartAt);
+                  last if ($loopLocation > $loopEndAt);
 
-              # --- DYNAMIC THERMAL FILTER (Neighbor Check) ---
-              if ($includeLoopPrimers) {
-                  # Loop vs Middle
-                  next if (abs($loopTm - $midTm) > $maxTmDiff);
-              } else {
-                  # Inner vs Middle (if no loop)
-                  next if (abs($innerTm - $midTm) > $maxTmDiff);
+                  # --- DYNAMIC THERMAL FILTER (Inner vs Loop) ---
+                  next if (abs($innerTm - $loopTm) > $maxTmDiff);
               }
-
-              # 3.3 Calculate Search Bounds for Outer Primer (F3)
-              my $outerStartAt = $searchStartAt;
-              my $outerEndAt = $middleLocation - 1 - $minPrimerSpacing;
               
-              my $loopToMiddleDistance = ($loopLocation - $loopLength + 1) - ($middleLocation + $middleLength);
+              # Distance Check
+              next if ($innerLocation - ($loopLocation + $loopLength) < $minPrimerSpacing);
               
-              my $outerCount = scalar(@{$masterOuterF_r});
-              for(my $k = 0; $k < $outerCount; $k++)
+              # 3.2 Calculate Search Bounds for Middle Primer (F2)
+              my $middleStartAt = $searchStartAt;
+              my $middleEndAt = $loopLocation - 1 - $minPrimerSpacing;
+              
+              my $innerToLoopDistance = $innerLocation - ($loopLocation + $loopLength);
+              
+              my $middleCount = scalar(@{$masterMiddleF_r});
+              for(my $j = 0; $j < $middleCount; $j++)
               {
-                  my $outerInfo = $masterOuterF_r->[$k];
-                  my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterF_data_r->[$k]};
+                  my $middleInfo = $masterMiddleF_r->[$j];
+                  my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleF_data_r->[$j]};
                   
                   # Fast-Fail
-                  next if ($outerLocation < $outerStartAt);
-                  last if ($outerLocation > $outerEndAt);
+                  next if ($middleLocation < $middleStartAt);
+                  last if ($middleLocation > $middleEndAt);
                   
                   # Distance Check
-                  next if ($outerLocation + $outerLength + $minPrimerSpacing > $middleLocation);
-                  
-                  # --- DYNAMIC THERMAL FILTER (Middle vs Outer) ---
-                  next if (abs($midTm - $outTm) > $maxTmDiff);
-                  
-                  # Calculate Penalty
-                  my $middleToOuterDistance = $middleLocation - ($outerLocation + $outerLength);
-                  my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
-                  
-                  my $spacingPenalty = 0;
-                  my $primer3Penalty = 0;
-                  my $detailStr = "";
-                  
+                  next if ($loopLocation - ($middleLocation + $middleLength) < $minPrimerSpacing);
+
+                  # --- DYNAMIC THERMAL FILTER (Neighbor Check) ---
                   if ($includeLoopPrimers) {
-                      # Ensure indices are within bounds of pre-computed arrays
-                      # (Assuming generateDistancePenalties covers $signatureMaxLength)
-                      $spacingPenalty = 
-                          ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight) +
-                          ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $loopPenalty * $loopPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
-                            ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight),
-                            ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($loopPenalty * $loopPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
+                      next if (abs($loopTm - $midTm) > $maxTmDiff);
                   } else {
-                      $spacingPenalty = 
-                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
+                      next if (abs($innerTm - $midTm) > $maxTmDiff);
+                  }
+
+                  # 3.3 Calculate Search Bounds for Outer Primer (F3)
+                  my $outerStartAt = $searchStartAt;
+                  my $outerEndAt = $middleLocation - 1 - $minPrimerSpacing;
+                  
+                  my $loopToMiddleDistance = ($loopLocation - $loopLength + 1) - ($middleLocation + $middleLength);
+                  
+                  my $outerCount = scalar(@{$masterOuterF_r});
+                  for(my $k = 0; $k < $outerCount; $k++)
+                  {
+                      my $outerInfo = $masterOuterF_r->[$k];
+                      my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterF_data_r->[$k]};
                       
-                      $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
-                            ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
-                  }
-                  
-                  my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
-                  
-                  # Save if best
-                  if ($currentSetPenalty < $bestSetPenalty) {
-                      $bestForwardInfos[$innerIndex] = [$loopInfo, $middleInfo, $outerInfo];
-                      $bestSetPenalty = $currentSetPenalty;
-                      $bestForwardPenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
-                      $forwardSetCount++;
-                      $_sig_fwd_hits++;  # Compteur de signatures Forward / Forward signature counter
-                  }
-              } # End Outer
-          } # End Middle
-      } # End Loop
-  } # End Inner
+                      # Fast-Fail
+                      next if ($outerLocation < $outerStartAt);
+                      last if ($outerLocation > $outerEndAt);
+                      
+                      # Distance Check
+                      next if ($outerLocation + $outerLength + $minPrimerSpacing > $middleLocation);
+                      
+                      # --- DYNAMIC THERMAL FILTER (Middle vs Outer) ---
+                      next if (abs($midTm - $outTm) > $maxTmDiff);
+                      
+                      # Calculate Penalty
+                      my $middleToOuterDistance = $middleLocation - ($outerLocation + $outerLength);
+                      my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
+                      
+                      my $spacingPenalty = 0;
+                      my $primer3Penalty = 0;
+                      my $detailStr = "";
+                      
+                      if ($includeLoopPrimers) {
+                          $spacingPenalty = 
+                              ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight) +
+                              ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight) +
+                              ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+                              
+                          $primer3Penalty = 
+                              $innerPenalty * $innerPenaltyWeight +
+                              $loopPenalty * $loopPenaltyWeight +
+                              $middlePenalty * $middlePenaltyWeight +
+                              $outerPenalty * $outerPenaltyWeight;
+                          
+                          $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
+                                ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight),
+                                ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight),
+                                ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                                ($innerPenalty * $innerPenaltyWeight),
+                                ($loopPenalty * $loopPenaltyWeight),
+                                ($middlePenalty * $middlePenaltyWeight),
+                                ($outerPenalty * $outerPenaltyWeight)
+                                );
+                      } else {
+                          $spacingPenalty = 
+                              ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
+                              ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+                              
+                          $primer3Penalty = 
+                              $innerPenalty * $innerPenaltyWeight +
+                              $middlePenalty * $middlePenaltyWeight +
+                              $outerPenalty * $outerPenaltyWeight;
+                      }
+                      
+                      my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
+                      
+                      # Save if best
+                      if ($currentSetPenalty < $bestSetPenalty) {
+                          $chunk_infos{$innerIndex} = [$loopInfo, $middleInfo, $outerInfo];
+                          $chunk_penalties{$innerIndex} = [$spacingPenalty, $primer3Penalty, $detailStr];
+                          $bestSetPenalty = $currentSetPenalty;
+                          $chunk_hits++ unless exists $chunk_infos{$innerIndex};
+                      }
+                  } # End Outer
+              } # End Middle
+          } # End Loop
+      } # End Inner chunk loop
+      
+      $pm_fwd->finish(0, {
+          infos => \%chunk_infos,
+          penalties => \%chunk_penalties,
+          hits => $chunk_hits,
+          done => $chunk_done,
+      });
+  } # End chunks
+  $pm_fwd->wait_all_children();
   
   # Finaliser la barre Forward / Finalize Forward bar
   print "  [Forward] $forwardSetCount combinaisons Forward trouvees sur $innerForwardCount amorces F1c.\n";
@@ -1669,191 +1678,198 @@ sub getOligosWithMismatchTolerance {
   my $_sig_rev_t0   = time();
   my $_sig_rev_done = 0;
   my $_sig_rev_hits = 0;  # Nombre de signatures Reverse trouvees / Reverse signatures found
-  print STDERR "  Recherche combinatoire Reverse: $innerReverseCount amorces B1c...\n";
+  my $pm_rev = LLNL::LAVA::ForkManager->new($options_r->{"threads"});
+  my $num_rev_chunks = $pm_rev->{max_processes} > 1 ? $pm_rev->{max_processes} * 4 : 1;
+  my $rev_chunk_size = int(($innerReverseCount + $num_rev_chunks - 1) / $num_rev_chunks);
+  $rev_chunk_size = 1 if $rev_chunk_size < 1;
 
-  for(my $innerIndex = 0; $innerIndex < $innerReverseCount; $innerIndex++)
-  {
-      # Barre de progression toutes les 50 iterations ou a 100%
-      # Progress bar every 50 iterations or at 100%
-      $_sig_rev_done = $innerIndex + 1;
-      if ($_sig_rev_done % 50 == 0 || $_sig_rev_done == $innerReverseCount) {
-        # Emission progression Flask / Flask progress emission
-        if ($_LAVA_IS_TTY || 1) {  # Toujours emettre pour Flask / Always emit for Flask
-          my $elapsed = time() - $_sig_rev_t0 + 0.001;
-          my $eta = ($_sig_rev_done < $innerReverseCount)
-                    ? int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed))
-                    : 0;
-          my $rate = $_sig_rev_done / $elapsed;
-          printf("[LAVA-PROGRESS] Signatures Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
-                 $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
-        }
+  $pm_rev->run_on_finish(sub {
+      my ($pid, $exit_code, $id, $exit_signal, $core_dump, $data_ref) = @_;
+      if (defined $data_ref && ref($data_ref) eq 'HASH') {
+          foreach my $idx (keys %{$data_ref->{infos}}) {
+              if (!defined $bestReverseInfos[$idx]) {
+                  $reverseSetCount++;
+              }
+              $bestReverseInfos[$idx] = $data_ref->{infos}->{$idx};
+              $bestReversePenalties[$idx] = $data_ref->{penalties}->{$idx};
+          }
+          $_sig_rev_hits += $data_ref->{hits} || 0;
+          $_sig_rev_done += $data_ref->{done} || 0;
+          if ($_LAVA_IS_TTY || 1) {
+              my $elapsed = time() - $_sig_rev_t0 + 0.001;
+              my $eta = ($_sig_rev_done < $innerReverseCount)
+                        ? int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed))
+                        : 0;
+              my $rate = $_sig_rev_done / $elapsed;
+              printf("[LAVA-PROGRESS] Signatures Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
+                     $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
+          }
       }
-      my $innerInfo = $masterInnerR_r->[$innerIndex];
-      my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerR_data_r->[$innerIndex]};
-      
-      my $bestSetPenalty = 1000000;
-      
-      # 4.1 Calculate Search Bounds for Loop Primer (Reverse)
-      # Inner (B1c) is at $innerLocation. 
-      # Search starts after Inner and goes downstream (3').
-      
-      my $searchStartAt = $innerLocation + 1 + $minPrimerSpacing;
-      
-      my $searchEndAt = $innerLocation + $signatureMaxLength - $innerLength - 20; 
-      
-      # Determine Loop List to iterate
-      my $currentLoopList_r = $includeLoopPrimers ? $masterLoopR_r : $masterLoopR_r; 
-      my $currentLoopData_r = $includeLoopPrimers ? $masterLoopR_data_r : $masterLoopR_data_r;
-      my $loopCount = scalar(@{$currentLoopList_r});
-      
-      # If NO loops, we update the placeholder location to be valid (start of range)
-      if (!$includeLoopPrimers) {
-           $currentLoopData_r->[0]->[0] = $searchStartAt - 1; # Dummy valid location
-      }
+  });
 
-      for(my $i = 0; $i < $loopCount; $i++)
+  for (my $chunk_start = 0; $chunk_start < $innerReverseCount; $chunk_start += $rev_chunk_size) {
+      my $chunk_end = $chunk_start + $rev_chunk_size - 1;
+      $chunk_end = $innerReverseCount - 1 if $chunk_end >= $innerReverseCount;
+      
+      $pm_rev->start($chunk_start) and next;
+      
+      my %chunk_infos = ();
+      my %chunk_penalties = ();
+      my $chunk_hits = 0;
+      my $chunk_done = 0;
+      
+      for(my $innerIndex = $chunk_start; $innerIndex <= $chunk_end; $innerIndex++)
       {
-          my $loopInfo = $currentLoopList_r->[$i];
-          my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
+          $chunk_done++;
+          my $innerInfo = $masterInnerR_r->[$innerIndex];
+          my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerR_data_r->[$innerIndex]};
           
-          if ($includeLoopPrimers) {
-              # Fast-Fail: Sorted by location.
-              next if ($loopLocation < $searchStartAt);
-              last if ($loopLocation > $searchEndAt);
-
-              # --- DYNAMIC THERMAL FILTER (Inner vs Loop) ---
-              next if (abs($innerTm - $loopTm) > $maxTmDiff);
+          my $bestSetPenalty = 1000000;
+          
+          # 4.1 Calculate Search Bounds for Loop Primer (Reverse)
+          my $searchStartAt = $innerLocation + 1 + $minPrimerSpacing;
+          my $searchEndAt = $innerLocation + $signatureMaxLength - $innerLength - 20; 
+          
+          # Determine Loop List to iterate
+          my $currentLoopList_r = $includeLoopPrimers ? $masterLoopR_r : $masterLoopR_r; 
+          my $currentLoopData_r = $includeLoopPrimers ? $masterLoopR_data_r : $masterLoopR_data_r;
+          my $loopCount = scalar(@{$currentLoopList_r});
+          
+          if (!$includeLoopPrimers) {
+              $currentLoopData_r->[0]->[0] = $searchStartAt; 
           }
-          
-          # 4.2 Calculate Search Bounds for Middle Primer (B2)
-          # Middle (B2) is downstream of Loop.
-          my $middleStartAt = $loopLocation + $loopLength + $minPrimerSpacing;
-          
-          # Ensure Middle isn't too close to Inner (respecting loop gap or standard gap)
-          if ($includeLoopPrimers) {
-              my $altMiddleStartAt = $innerLocation + ($loopMinGap + 1);
-              $middleStartAt = $altMiddleStartAt if ($altMiddleStartAt > $middleStartAt);
-          } else {
-              my $altMiddleStartAt = $innerLocation + $minPrimerSpacing;
-              $middleStartAt = $altMiddleStartAt if ($altMiddleStartAt > $middleStartAt);
-          }
-          
-          my $middleEndAt = $searchEndAt;
 
-          my $innerToLoopDistance = $loopLocation - ($innerLocation + 1);
-          
-          my $middleCount = scalar(@{$masterMiddleR_r});
-          for(my $j = 0; $j < $middleCount; $j++)
+          for(my $i = 0; $i < $loopCount; $i++)
           {
-              my $middleInfo = $masterMiddleR_r->[$j];
-              my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleR_data_r->[$j]};
+              my $loopInfo = $currentLoopList_r->[$i];
+              my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
               
-              # Fast-Fail
-              next if ($middleLocation < $middleStartAt);
-              last if ($middleLocation > $middleEndAt);
-              
-              # Validity Checks 
               if ($includeLoopPrimers) {
-                   # Check overlap with Loop
-                   next if ($middleLocation - $middleLength - $minPrimerSpacing < $loopLocation + $loopLength - 1);
-                   # Check Gap with Inner 
-                   next if ($middleLocation - $middleLength - $loopMinGap < $innerLocation);
+                  next if ($loopLocation < $searchStartAt);
+                  last if ($loopLocation > $searchEndAt);
+                  next if (abs($innerTm - $loopTm) > $maxTmDiff);
               }
-
-              # --- DYNAMIC THERMAL FILTER (Neighbor Check) ---
-              if ($includeLoopPrimers) {
-                  # Loop vs Middle
-                  next if (abs($loopTm - $midTm) > $maxTmDiff);
-              } else {
-                  # Inner vs Middle (if no loop)
-                  next if (abs($innerTm - $midTm) > $maxTmDiff);
-              }
-
-              # 4.3 Calculate Search Bounds for Outer Primer (B3)
-              my $outerStartAt = $middleLocation + 1 + $minPrimerSpacing;
-              my $outerEndAt = $searchEndAt;
               
-              my $loopToMiddleDistance = ($middleLocation - $middleLength + 1) - ($loopLocation + $loopLength);
-
-              my $outerCount = scalar(@{$masterOuterR_r});
-              for(my $k = 0; $k < $outerCount; $k++)
+              next if ($loopLocation - ($innerLocation + $innerLength) < $minPrimerSpacing);
+              
+              # 4.2 Calculate Search Bounds for Middle Primer (Reverse)
+              my $middleStartAt = $loopLocation + $loopLength + $minPrimerSpacing;
+              if (!$includeLoopPrimers) {
+                   $middleStartAt = $innerLocation + $innerLength + $minPrimerSpacing;
+              }
+              my $middleEndAt = $searchEndAt;
+              
+              my $innerToLoopDistance = $loopLocation - ($innerLocation + $innerLength);
+              
+              my $middleCount = scalar(@{$masterMiddleR_r});
+              for(my $j = 0; $j < $middleCount; $j++)
               {
-                  my $outerInfo = $masterOuterR_r->[$k];
-                  my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterR_data_r->[$k]};
+                  my $middleInfo = $masterMiddleR_r->[$j];
+                  my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleR_data_r->[$j]};
                   
-                  # Fast-Fail
-                  next if ($outerLocation < $outerStartAt);
-                  last if ($outerLocation > $outerEndAt);
-                  
-                  # Distance Check : B3_leftmost - spacing > B2_rightmost (gap >= minPrimerSpacing)
-                  # Correction off-by-one : leftmost de B3 = outerLocation - outerLength + 1
-                  next if ($outerLocation - $outerLength + 1 - $minPrimerSpacing <= $middleLocation);
-
-                  # --- DYNAMIC THERMAL FILTER (Middle vs Outer) ---
-                  next if (abs($midTm - $outTm) > $maxTmDiff);
-                  
-                  # Calculate Penalty
-                  my $middleToOuterDistance = ($outerLocation - $outerLength) - $middleLocation;
-                  my $innerToMiddleDistance = ($middleLocation - $middleLength) - $innerLocation;
-                  
-                  my $spacingPenalty = 0;
-                  my $primer3Penalty = 0;
-                  my $detailStr = "";
+                  next if ($middleLocation < $middleStartAt);
+                  last if ($middleLocation > $middleEndAt);
                   
                   if ($includeLoopPrimers) {
-                      $spacingPenalty = 
-                          ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight) +
-                          ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $loopPenalty * $loopPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
-                            ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight),
-                            ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($loopPenalty * $loopPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
+                      next if ($middleLocation - ($loopLocation + $loopLength) < $minPrimerSpacing);
                   } else {
-                      $spacingPenalty = 
-                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
-                            ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
+                      next if ($middleLocation - ($innerLocation + $innerLength) < $minPrimerSpacing);
                   }
-                  
-                  my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
-                  
-                  if ($currentSetPenalty < $bestSetPenalty) {
-                      $bestReverseInfos[$innerIndex] = [$loopInfo, $middleInfo, $outerInfo];
-                      $bestSetPenalty = $currentSetPenalty;
-                      $bestReversePenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
-                      $reverseSetCount++;
-                      $_sig_rev_hits++;  # Compteur de signatures Reverse / Reverse signature counter
-                  }
-              } # End Outer
-          } # End Middle
-      } # End Loop
-  } # End Inner
 
+                  if ($includeLoopPrimers) {
+                      next if (abs($loopTm - $midTm) > $maxTmDiff);
+                  } else {
+                      next if (abs($innerTm - $midTm) > $maxTmDiff);
+                  }
+
+                  # 4.3 Calculate Search Bounds for Outer Primer (Reverse)
+                  my $outerStartAt = $middleLocation + $middleLength + $minPrimerSpacing;
+                  my $outerEndAt = $searchEndAt;
+                  
+                  my $loopToMiddleDistance = $middleLocation - ($loopLocation + $loopLength);
+                  
+                  my $outerCount = scalar(@{$masterOuterR_r});
+                  for(my $k = 0; $k < $outerCount; $k++)
+                  {
+                      my $outerInfo = $masterOuterR_r->[$k];
+                      my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterR_data_r->[$k]};
+                      
+                      next if ($outerLocation < $outerStartAt);
+                      last if ($outerLocation > $outerEndAt);
+                      
+                      next if ($outerLocation - ($middleLocation + $middleLength) < $minPrimerSpacing);
+                      
+                      next if (abs($midTm - $outTm) > $maxTmDiff);
+                      
+                      my $middleToOuterDistance = $outerLocation - ($middleLocation + $middleLength);
+                      my $innerToMiddleDistance = $middleLocation - ($innerLocation + $innerLength);
+                      
+                      my $spacingPenalty = 0;
+                      my $primer3Penalty = 0;
+                      my $detailStr = "";
+                      
+                      if ($includeLoopPrimers) {
+                          $spacingPenalty = 
+                              ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight) +
+                              ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight) +
+                              ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+                              
+                          $primer3Penalty = 
+                              $innerPenalty * $innerPenaltyWeight +
+                              $loopPenalty * $loopPenaltyWeight +
+                              $middlePenalty * $middlePenaltyWeight +
+                              $outerPenalty * $outerPenaltyWeight;
+                          
+                          $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
+                                ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight),
+                                ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight),
+                                ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                                ($innerPenalty * $innerPenaltyWeight),
+                                ($loopPenalty * $loopPenaltyWeight),
+                                ($middlePenalty * $middlePenaltyWeight),
+                                ($outerPenalty * $outerPenaltyWeight)
+                                );
+                      } else {
+                          $spacingPenalty = 
+                              ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
+                              ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+                              
+                          $primer3Penalty = 
+                              $innerPenalty * $innerPenaltyWeight +
+                              $middlePenalty * $middlePenaltyWeight +
+                              $outerPenalty * $outerPenaltyWeight;
+                      
+                          $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
+                                ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
+                                ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                                ($innerPenalty * $innerPenaltyWeight),
+                                ($middlePenalty * $middlePenaltyWeight),
+                                ($outerPenalty * $outerPenaltyWeight)
+                                );
+                      }
+                      
+                      my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
+                      
+                      if ($currentSetPenalty < $bestSetPenalty) {
+                          $chunk_infos{$innerIndex} = [$loopInfo, $middleInfo, $outerInfo];
+                          $chunk_penalties{$innerIndex} = [$spacingPenalty, $primer3Penalty, $detailStr];
+                          $bestSetPenalty = $currentSetPenalty;
+                          $chunk_hits++ unless exists $chunk_infos{$innerIndex};
+                      }
+                  } # End Outer
+              } # End Middle
+          } # End Loop
+      } # End Inner chunk loop
+      
+      $pm_rev->finish(0, {
+          infos => \%chunk_infos,
+          penalties => \%chunk_penalties,
+          hits => $chunk_hits,
+          done => $chunk_done,
+      });
+  } # End chunks
+  $pm_rev->wait_all_children();
+  
   # Finaliser la barre Reverse / Finalize Reverse bar
   print "  [Reverse] $reverseSetCount combinaisons Reverse trouvees sur $innerReverseCount amorces B1c.\n";
 

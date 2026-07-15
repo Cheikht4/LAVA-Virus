@@ -1493,3 +1493,75 @@ Dans le design d'amorces LAMP enrichi ou classique sur des génomes viraux compl
 
 **Impact attendu** :
 Une lisibilité et une transparence exceptionnelles du suivi en temps réel sur l'interface Web LAVA_Virus : le chercheur visualise précisément la progression de la validation étape par étape et par type d'amorce LAMP.
+
+---
+
+### [2026-07-09] Fonctionnalité d'Importation et Réplication Automatique des Paramètres d'Exécution
+
+**Date/Étape** : 2026-07-09 - Import de fichier de paramètres (`.params.txt` ou `.json`) pour faciliter la reproductibilité expérimentale.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `templates/index.html`
+
+**Nature du changement** : [Architecture / Interface / UX]
+
+**Explication technique** :
+1. **Création du point d'entrée d'importation (`/upload_params_file`)** : Implémentation d'une nouvelle route Flask capable de recevoir et d'analyser les fichiers de paramètres générés lors d'exécutions précédentes (`.params.txt` ou format `.json`).
+2. **Analyseur de format LAVA multi-format** : Le parseur extrait dynamiquement le type de script (`STEM` ou `LOOP`), le mode de design (`classic` ou `enriched`), ainsi que l'intégralité des drapeaux Perl (ex: `--primer_min_match_percent: 85.0`). Il mappe chaque paramètre sur sa variable de session Python adéquate en convertissant automatiquement les types de données (`int`, `float`, `bool`, `str`).
+3. **Intégration ergonomique dans l'IHM** : Ajout de deux boutons d'action rapide "Importer un fichier de paramètres" (dans l'en-tête de la section de configuration et à côté du bouton de sauvegarde) reliés à une fonction AJAX en JavaScript. Dès la sélection du fichier, le formulaire est mis à jour et rechargé instantanément pour refléter avec exactitude les conditions expérimentales importées.
+
+**Justification biologique** :
+En recherche clinique et épidémiologique, la comparaison de performance des amorces LAMP sur différentes souches virales exige une stricte invariance des conditions thermodynamiques (températures de fusion $T_m$, concentrations salines et dNTP, tolérance aux mésappariements, fenêtres de réduction spatiale). Permettre de recharger directement un fichier `.params.txt` issu d'un run réussi évite les erreurs de saisie manuelle et garantit la reproductibilité parfaite des protocoles in silico d'un isolat à l'autre ou entre différents collaborateurs du laboratoire.
+
+**Impact attendu** :
+Un gain de temps considérable pour l'utilisateur qui peut désormais répliquer ou ajuster des conditions d'expérience complexes en un seul clic via l'import de ses fichiers de paramètres antérieurs.
+
+---
+
+### [2026-07-09] Audit et Durcissement de Sécurité de la Route d'Importation de Paramètres
+
+**Date/Étape** : 2026-07-09 - Audit et durcissement complet de `/upload_params_file`.
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+
+**Nature du changement** : [Architecture / Bug Fix / Sécurité]
+
+**Explication technique** :
+1. **Validation stricte par liste blanche (Priorité 1)** : Construction dynamique de l'ensemble des clés autorisées à partir de `get_default_params().keys()`. Avant toute injection dans `session['params']`, le moteur vérifie que la clé appartient à cette liste blanche ; toute clé inconnue ou malveillante est ignorée silencieusement dans les branches JSON et texte. Les valeurs `script_type` et `lamp_mode` sont rigoureusement restreintes respectivement à `['STEM', 'LOOP']` et `['classic', 'enriched']`.
+2. **Limitation de taille et protection anti-abus (Priorité 2)** : Application du rate limiter (`check_rate_limit(max_requests=15, window_seconds=60)`) en amont de la route. Vérification préalable de la taille du fichier importé sur le disque (`file.seek(0, os.SEEK_END)`) pour rejeter immédiatement tout fichier excédant 1 Mo.
+3. **Masquage des traces techniques en production (Priorité 3)** : Conditionnement du retour des exceptions : en mode `FLASK_ENV=production`, l'application ne retourne plus la trace brute (`str(e)`) au client, se contentant d'un message utilisateur sécurisé et traduit.
+4. **Filtrage des extensions et nettoyage des noms (Priorité 4)** : Mise en place d'une liste blanche d'extensions (`ALLOWED_PARAMS_EXTENSIONS = {'txt', 'json', 'params'}` et fichiers `.params.txt`) combinée à l'appel systématique à `secure_filename`.
+
+**Justification biologique** :
+Les pipelines bioinformatiques exposés sur un serveur web clinique doivent garantir l'intégrité absolue de la session d'analyse et prévenir toute injection d'attributs arbitraires ou attaque par déni de service (saturation mémoire par upload massif). Ce durcissement protège le moteur thermodynamique LAVA tout en préservant la reproductibilité des analyses de routine.
+
+**Impact attendu** :
+Une sécurité logicielle de niveau production : étanchéité totale face aux injections de paramètres illégitimes et aux surcharges serveur, sans altérer l'expérience utilisateur lors de l'import de fichiers de paramètres légitimes.
+
+---
+
+### [2026-07-15] Parallélisation Multi-Cœurs du Moteur Combinatoire LAVA (Option B)
+
+**Date/Étape** : 2026-07-15 - Parallélisation multi-processus native des boucles combinatoires via `Parallel::ForkManager`.
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/ForkManager.pm` (nouveau module d'encapsulation multi-cœurs)
+- `lava_loop_primer.pl` (parallélisation des boucles combinatoires Forward et Reverse, option `--threads|cpu`)
+- `lava_stem_primer.pl` (parallélisation des boucles combinatoires Stem Forward et Stem Reverse, option `--threads|cpu`)
+
+**Nature du changement** : [Algorithmique / Architecture / Performance]
+
+**Explication technique** :
+1. **Implémentation du module `LLNL::LAVA::ForkManager` (Option B)** : Création d'un module Perl interne gérant dynamiquement la concurrence multi-cœurs. Si le module CPAN `Parallel::ForkManager` est disponible sur l'hôte, le moteur exploite le multi-processus POSIX nativement. Si le module n'est pas installé, un mode dégradé séquentiel ultra-léger garantit la portabilité sans erreur de compilation.
+2. **Découpage en Chunks et Copy-On-Write (COW)** : Au lieu d'utiliser le module natif `threads` de Perl (sujet à de lourdes fuites mémoire avec BioPerl et déconseillé en bioinformatique intensive), l'architecture sépare l'espace de recherche en sous-ensembles (chunks) d'amorces (`$chunk_start` à `$chunk_end`). Chaque processus enfant hérite instantanément des tables de pénalités en lecture seule grâce au mécanisme de mémoire partagée *Copy-On-Write* du noyau Unix.
+3. **Agrégation Déterministe et Filtrage Thermodynamique** : À la fin de chaque sous-processus (`run_on_finish`), le processus parent agrège les meilleures combinaisons d'amorces (`$bestForwardInfos`, `$bestForwardPenalties`, `$bestReverseInfos`, `$bestReversePenalties`) et additionne les compteurs de signatures (`$_sig_fwd_hits`, `$_sig_rev_hits`).
+4. **Interface CLI `--threads|cpu`** : Ajout du paramètre `--threads|cpu` (valeur par défaut : `auto` configurée sur `LLNL::LAVA::ForkManager->_auto_cpus()`), permettant à l'utilisateur ou à l'interface web d'allouer précisément le nombre de cœurs de calcul ou de laisser le moteur adapter automatiquement sa charge au processeur de la machine.
+
+**Justification biologique** :
+L'évaluation combinatoire exhaustive (recherche d'intersections et minimisation des pénalités sigmoïdes de distance et d'énergie d'hybridation sur l'ensemble des amorces F1c, F2, F3, B1c, B2, B3 et Stem) implique le parcours de plusieurs centaines de milliers à plusieurs millions de combinaisons thermodynamiques (`inner × stem × middle × outer`). Sur des génomes viraux très riches en variants (comme la Dengue ou le SARS-CoV-2), la recherche séquentielle pouvait nécessiter plusieurs heures de calcul. La parallélisation distribue cette évaluation cinétique sur tous les cœurs disponibles, maintenant rigoureusement les mêmes critères de sélectivité (`maxDeltaTm`, `minPrimerSpacing`, `signatureMaxLength`) sans perte de candidats.
+
+**Impact attendu** :
+Réduction drastique du temps d'exécution (accélération quasi-linéaire selon le nombre de cœurs alloués, passant de plusieurs heures à quelques minutes ou secondes sur les jeux d'amorces complexes), tout en garantissant une stricte reproductibilité des signatures LAMP et une stabilité mémoire absolue de l'application serveur LAVA.
+

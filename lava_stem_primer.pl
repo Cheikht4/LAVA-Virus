@@ -98,7 +98,8 @@ use LLNL::LAVA::PrimerSetInfo::PCRPair;
 use LLNL::LAVA::PrimerSet::LAMP;
 use LLNL::LAVA::Core qw(generateDistancePenalties calculate_proportional_geometry countDegenerateBases);
 use LLNL::LAVA::Validator qw(checkPrimerMismatchTolerance getPrimerTargetedSequences isIUPACCompatible rev_comp generateIUPACCode validateCompleteSignatureSpacing);
-use LLNL::LAVA::PipelineUtils qw(buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths); # buildReversePrimers retiré (DEPRECATED, remplacé par buildNativeReversePool)
+use LLNL::LAVA::PipelineUtils qw(buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths);
+use LLNL::LAVA::ForkManager;
 
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
 # Enable STDOUT autoflush for real-time log streaming via Flask
@@ -297,6 +298,7 @@ sub getOligosWithMismatchTolerance {
     (
       "alignment_fasta=s" => \$options{"alignment_fasta"},
       "output_file=s" => \$options{"output_file"}, 
+      "threads|cpu=s" => \$options{"threads"},
       "signature_max_length=i" => \$options{"signature_max_length"},
       "total_signature_length=i" => \$options{"total_signature_length"},
 
@@ -1450,292 +1452,225 @@ sub getOligosWithMismatchTolerance {
     my $forwardSetCount = 0;
 
     print "Scanning Forward Primer Combinations...\n";
-    # Barre de progression Flask pour les signatures Forward / Flask progress bar for Forward signatures
     my $_sig_fwd_t0   = time();
     my $_sig_fwd_done = 0;
-    my $_sig_fwd_hits = 0;  # Nombre de signatures Forward trouvees / Forward signatures found
+    my $_sig_fwd_hits = 0;
     print STDERR "  Recherche combinatoire Stem Forward: $innerForwardCount amorces F1c...\n";
 
-    for(my $innerIndex = 0; $innerIndex < $innerForwardCount; $innerIndex++)
-    {
-      # Emission LAVA-PROGRESS toutes les 50 iterations / Emit LAVA-PROGRESS every 50 iterations
-      $_sig_fwd_done = $innerIndex + 1;
-      if ($_sig_fwd_done % 50 == 0 || $_sig_fwd_done == $innerForwardCount) {
-        if ($_LAVA_IS_TTY || 1) {
-          my $elapsed = time() - $_sig_fwd_t0 + 0.001;
-          my $eta = ($_sig_fwd_done < $innerForwardCount)
-                    ? int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed))
-                    : 0;
-          my $rate = $_sig_fwd_done / $elapsed;
-          printf("[LAVA-PROGRESS] Signatures Stem Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
-                 $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
+    my $pm_fwd = LLNL::LAVA::ForkManager->new($options{"threads"});
+    my $num_fwd_chunks = $pm_fwd->{max_processes} > 1 ? $pm_fwd->{max_processes} * 4 : 1;
+    my $fwd_chunk_size = int(($innerForwardCount + $num_fwd_chunks - 1) / $num_fwd_chunks);
+    $fwd_chunk_size = 1 if $fwd_chunk_size < 1;
+
+    $pm_fwd->run_on_finish(sub {
+        my ($pid, $exit_code, $id, $exit_signal, $core_dump, $data_ref) = @_;
+        if (defined $data_ref && ref($data_ref) eq 'HASH') {
+            foreach my $idx (keys %{$data_ref->{infos}}) {
+                if (!defined $bestForwardInfos[$idx]) {
+                    $forwardSetCount++;
+                }
+                $bestForwardInfos[$idx] = $data_ref->{infos}->{$idx};
+                $bestForwardPenalties[$idx] = $data_ref->{penalties}->{$idx};
+            }
+            $_sig_fwd_hits += $data_ref->{hits} || 0;
+            $_sig_fwd_done += $data_ref->{done} || 0;
+            if ($_LAVA_IS_TTY || 1) {
+                my $elapsed = time() - $_sig_fwd_t0 + 0.001;
+                my $eta = ($_sig_fwd_done < $innerForwardCount)
+                          ? int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed))
+                          : 0;
+                my $rate = $_sig_fwd_done / $elapsed;
+                printf("[LAVA-PROGRESS] Signatures Stem Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
+                       $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
+            }
         }
-      }
-      my $innerInfo = $innerForwardSubset_r->[$innerIndex];
-      my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = 
-        @{$innerForwardSubsetData_r->[$innerIndex]};
+    });
 
-      my $bestSetPenalty = 1000000; # Riduculously large starting value
+    for (my $chunk_start = 0; $chunk_start < $innerForwardCount; $chunk_start += $fwd_chunk_size) {
+        my $chunk_end = $chunk_start + $fwd_chunk_size - 1;
+        $chunk_end = $innerForwardCount - 1 if $chunk_end >= $innerForwardCount;
+        
+        $pm_fwd->start($chunk_start) and next;
+        
+        my %chunk_infos = ();
+        my %chunk_penalties = ();
+        my $chunk_hits = 0;
+        my $chunk_done = 0;
+        
+        for(my $innerIndex = $chunk_start; $innerIndex <= $chunk_end; $innerIndex++)
+        {
+            $chunk_done++;
+            my $innerInfo = $innerForwardSubset_r->[$innerIndex];
+            my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = 
+              @{$innerForwardSubsetData_r->[$innerIndex]};
 
-      # Calculate the first and last base locations to consider for the 
-      # STEM forward primer (on the plus strand darn it... need an inversion)
-      my $searchStartAt = $innerLocation - $signatureMaxLength +
-        $innerLength + 20; # 20 represents 2 other primer min lengths...?
-      if($searchStartAt < 0)
-      {
-	$searchStartAt = 0;
-      }
+            my $bestSetPenalty = 1000000;
 
-      # STEM ARCHITECTURE: STEM primers are placed AFTER inner forward primer (F1c)
-      # et AVANT le B1c. La borne max = F1c_end + innerPairTargetLength/2
-      # STEM Start At and End At are indexes where the STEM SEARCH starts and ends
-      # FSTEM must lie between F1c (innerLocation+innerLength) and the midpoint F1-B1
-      my $stemStartAt = $innerLocation + $innerLength + $minPrimerSpacing;
-      my $stemEndAt   = $innerLocation + $innerLength + int($innerPairTargetLength / 2);
-      if($stemEndAt < $stemStartAt) { $stemEndAt = $stemStartAt + 50; }  # fallback
-      if($stemEndAt < 0) { $stemEndAt = 0; }
+            my $searchStartAt = $innerLocation - $signatureMaxLength +
+              $innerLength + 20;
+            if($searchStartAt < 0) { $searchStartAt = 0; }
 
-      # Progression : amorce inner suivante (debug retiré / debug removed)
-      #print "(PA $sequenceLength long, start at $searchStartAt, maxLen $signatureMaxLength, $innerLocation->$stemStartAt-$stemEndAt)";
-      #print "(PA* $stemStartAt-$stemEndAt)";
+            my $stemStartAt = $innerLocation + $innerLength + $minPrimerSpacing;
+            my $stemEndAt   = $innerLocation + $innerLength + int($innerPairTargetLength / 2);
+            if($stemEndAt < $stemStartAt) { $stemEndAt = $stemStartAt + 50; }
+            if($stemEndAt < 0) { $stemEndAt = 0; }
 
-      # If no STEM primers sought, then overwrite the STEM primer list with the
-      # single placeholder, one-length (but ideally zero-length), zero-penalty 
-      # STEM primer, placed at the end of the inner primer, to make sure it 
-      # appears to fit within the acceptable locations
-      if($includeStemPrimers == $FALSE)
-      {
-	#print "\n\n\nNO STEM?!\n\n\n";
-        my $placeHolderPrimer = LLNL::LAVA::Oligo->new(
-	  {
-            "sequence" => "N",
-	    "location" => $stemEndAt + 1, # Extra position to un-do length of 1
-	    "strand" => "minus",
-	  });
-        $placeHolderPrimer->setTag("primer3_penalty", 0);
-        $placeHolderPrimer->setTag("primer3_tm", 0);
+            my $curr_stemSubset_r = $stemForwardSubset_r;
+            my $curr_stemSubsetData_r = $stemForwardSubsetData_r;
+            my $curr_stemCount = $stemForwardCount;
 
-        my $placeHolderInfo = LLNL::LAVA::PrimerInfo->new(
-	  {
-            "penalty" => 0,
-	    "sequence" => $placeHolderPrimer->sequence(),
-	    "location" =>$placeHolderPrimer->location(),
-	    "length" => $placeHolderPrimer->length(),
-	    "analyzed_primer" => $placeHolderPrimer,
-	  });
-
-        $stemForwardSubset_r = [$placeHolderInfo];
-        $stemForwardSubsetData_r = [[$stemEndAt + 1, 1, 0]]; # [location, length, penalty]
-	$stemForwardCount = 1; 
-      }
-
-      # Start of the 3-level nested loop for forward primers.
-      # Should  exhaustively iterate over STEM, middle, outer 
-      # combinations based on the inner pair
-      for(my $i = 0; $i < $stemForwardCount; $i++)
-      {
-	my $stemInfo = $stemForwardSubset_r->[$i];
-	my ($stemLocation, $stemLength, $stemPenalty, $stemTm) = 
-	  @{$stemForwardSubsetData_r->[$i]};
-        #my $stemLocation = $stemInfo->getLocation();
-        #my $stemLength = $stemInfo->getLength();
-
-	# Special inversion for STEM primer, because forward STEM primer was
-	# designed on the minus strand.
-	
-        # Seek to the first STEM primer within range
-	# but, accept placeholder STEM primer
-        if($stemLocation < $stemStartAt &&
-	   $stemLength != 1)
-	{
-	  next;
-	}
-
-	# Stop when STEM primer goes out of range	
-	if($stemLocation > $stemEndAt &&
-	   $stemLength != 1)
-	{
-	  last;
-	}
-
-        # Progression : itération STEM (debug retiré / debug removed)
-
-        # No check for STEM->inner overlap, because stemEndAt is the location limiter
-
-	# STEM ARCHITECTURE: Middle primers are positioned independently of STEM primers
-	# since STEM primers are now between inner forward and reverse primers
-        my $middleStartAt = $searchStartAt;
-        my $middleEndAt = $innerLocation - $minPrimerSpacing;  
-	if($middleEndAt < 0)
-	{
-	  $middleEndAt = 0;
-	}
-        #print "(LA $middleStartAt-$middleEndAt)";
-        # STEM ARCHITECTURE: Calculate distance from inner forward to STEM forward
-        my $innerToStemDistance = $stemLocation - ($innerLocation + $innerLength);
-        # Ensure distance is non-negative
-        if($innerToStemDistance < 0) { $innerToStemDistance = 0; }
-
-        # --- DYNAMIC THERMAL FILTER (Stem vs Inner) ---
-        # Only check if stem exists (not placeholder which has 0 tm)
-        if ($includeStemPrimers == $TRUE && $stemTm > 0) {
-            next if (abs($innerTm - $stemTm) > $maxDeltaTm);
-        }
-
-        for(my $j = 0; $j < $middleForwardCount; $j++)
-	{
-	  my $middleInfo = $middleForwardSubset_r->[$j];
-	  my ($middleLocation, $middleLength, $middlePenalty, $midTm) = 
-	    @{$middleForwardSubsetData_r->[$j]};
-
-          #my $middleLocation = $middleInfo->getLocation();
-          #my $middleLength = $middleInfo->getLength();
-
-	  # Seek to the first middle primer within range
-	  if($middleLocation < $middleStartAt)
-	  {
-	    next;
-	  }
-
-	  # Stop when middle primer goes out of range
-	  if($middleLocation > $middleEndAt)
-	  {
-	    last;
-	  }
-
-          # Progression : itération Middle (debug retiré / debug removed)
-          
-          # --- DYNAMIC THERMAL FILTER ---
-          # Check Middle vs Stem (if Stem exists) or Middle vs Inner (if no Stem)
-          if ($includeStemPrimers == $TRUE && $stemTm > 0) {
-              next if (abs($stemTm - $midTm) > $maxDeltaTm); 
-          } else {
-             # If no stem, Middle follows Inner
-             next if (abs($innerTm - $midTm) > $maxDeltaTm);
-          }
-
-	  # STEM ARCHITECTURE: Only check spacing between middle and inner primers
-	  # STEM primers are no longer between middle and inner
-	  if($middleLocation + $middleLength + $minPrimerSpacing > $innerLocation)
-	  {
-	    next;
-	  }
-
-	  my $outerStartAt = $searchStartAt;
-          my $outerEndAt = $middleLocation - 1 - $minPrimerSpacing;
-
-         #print "(MA $outerStartAt-$outerEndAt)";
-
-         # STEM ARCHITECTURE: Calculate direct distance between inner and middle primers
-         # STEM primers are no longer between them
-          my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
-          # Ensure distance is non-negative
-          if($innerToMiddleDistance < 0) { $innerToMiddleDistance = 0; }
-
-               
-
-          for(my $k = 0; $k < $outerForwardCount; $k++)
-	  {
-	    my $outerInfo = $outerForwardSubset_r->[$k];
-	    my ($outerLocation, $outerLength, $outerPenalty, $outTm) = 
-	      @{$outerForwardSubsetData_r->[$k]};
-	    #my $outerLocation = $outerInfo->getLocation();
-            #my $outerLength = $outerInfo->getLength();
- 
-            # Seek to first outer primer within range
-	    if($outerLocation < $outerStartAt)
-	    {
-	      next;
-	    }
-
-	    # Stop when outer primer goes out of range
-	    if($outerLocation > $outerEndAt)
-	    {
-              last;
-	    }
-
-            #print "O";
-            # Next primer if this outer doesn't leave enough spacing to the middle primer
-            if($outerLocation + $outerLength + $minPrimerSpacing >
-	      $middleLocation)
-	    {
-	      next;
-	    }
-            #print "(OA)";
-            
-            # --- DYNAMIC THERMAL FILTER (Middle vs Outer) ---
-            next if (abs($midTm - $outTm) > $maxDeltaTm);
-
-	    # Inter-primer distance used for calculating spacing penalty
-            # Calculate middle to outer distance
-            my $middleToOuterDistance = $middleLocation - ($outerLocation + $outerLength);
-            if($middleToOuterDistance < 0) { $middleToOuterDistance = 0; }
-            
-            my $spacingPenalty = 0;
-            my $primer3Penalty = 0;
-            my $detailStr = "";
-            # Clamper les distances au max des tableaux de penalites (evite index OOB silencieux → undef)
-            # Clamp distances to max penalty array index (prevents silent OOB → undef penalty)
-            my $maxPenIdx = $signatureMaxLength - 1;
-            my $d_stem   = ($innerToStemDistance   < $maxPenIdx) ? $innerToStemDistance   : $maxPenIdx;
-            my $d_middle = ($innerToMiddleDistance < $maxPenIdx) ? $innerToMiddleDistance : $maxPenIdx;
-            my $d_outer  = ($middleToOuterDistance < $maxPenIdx) ? $middleToOuterDistance : $maxPenIdx;
-
-            if($includeStemPrimers == $TRUE)
+            if($includeStemPrimers == $FALSE)
             {
-              # STEM ARCHITECTURE: Calculate spacing between inner-STEM and inner-middle
-              $spacingPenalty = 
-                ($innerToLoopPenalties_r->[$d_stem]    * $innerToStemPenaltyWeight) +
-                ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight);
-              $primer3Penalty = 
-                $innerPenalty * $innerPenaltyWeight +
-                $stemPenalty  * $stemPenaltyWeight +
-                $middlePenalty * $middlePenaltyWeight +
-                $outerPenalty * $outerPenaltyWeight;
-              
-              $detailStr = sprintf("Spc[I_S:%.1f I_M:%.1f M_O:%.1f] Thm[I:%.1f S:%.1f M:%.1f O:%.1f]",
-                    ($innerToLoopPenalties_r->[$d_stem]    * $innerToStemPenaltyWeight),
-                    ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight),
-                    ($innerPenalty * $innerPenaltyWeight),
-                    ($stemPenalty  * $stemPenaltyWeight),
-                    ($middlePenalty * $middlePenaltyWeight),
-                    ($outerPenalty * $outerPenaltyWeight));
-            }
-            else
-            {
-              $spacingPenalty = 
-                ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight);
-              $primer3Penalty = 
-                $innerPenalty * $innerPenaltyWeight +
-                $middlePenalty * $middlePenaltyWeight +
-                $outerPenalty * $outerPenaltyWeight;
-              
-              $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]",
-                    ($innerToMiddlePenalties_r->[$d_middle] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$d_outer]  * $middleToOuterPenaltyWeight),
-                    ($innerPenalty * $innerPenaltyWeight),
-                    ($middlePenalty * $middlePenaltyWeight),
-                    ($outerPenalty * $outerPenaltyWeight));
-            }
-           
-            my $forwardSetPenalty = $spacingPenalty + $primer3Penalty;
-            if($forwardSetPenalty < $bestSetPenalty)
-            {
-              $bestForwardInfos[$innerIndex] = [$stemInfo, $middleInfo, $outerInfo];
-              $bestSetPenalty = $forwardSetPenalty;
-              $forwardSetCount++;
-              $_sig_fwd_hits++;  # Compteur de signatures Fwd / Fwd signature counter
-              $bestForwardPenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
-            }
-          } # End forward outer iteration
-        } # End forward middle iteration
-      } # End forward STEM iteration
-    } # End forward inner iteration
+              my $placeHolderPrimer = LLNL::LAVA::Oligo->new(
+                {
+                  "sequence" => "N",
+                  "location" => $stemEndAt + 1,
+                  "strand" => "minus",
+                });
+              $placeHolderPrimer->setTag("primer3_penalty", 0);
+              $placeHolderPrimer->setTag("primer3_tm", 0);
 
-    # Finaliser la barre Forward / Finalize Forward bar
+              my $placeHolderInfo = LLNL::LAVA::PrimerInfo->new(
+                {
+                  "penalty" => 0,
+                  "sequence" => $placeHolderPrimer->sequence(),
+                  "location" => $placeHolderPrimer->location(),
+                  "length" => $placeHolderPrimer->length(),
+                  "analyzed_primer" => $placeHolderPrimer,
+                });
+
+              $curr_stemSubset_r = [$placeHolderInfo];
+              $curr_stemSubsetData_r = [[$stemEndAt + 1, 1, 0, 0]];
+              $curr_stemCount = 1; 
+            }
+
+            for(my $i = 0; $i < $curr_stemCount; $i++)
+            {
+              my $stemInfo = $curr_stemSubset_r->[$i];
+              my ($stemLocation, $stemLength, $stemPenalty, $stemTm) = 
+                @{$curr_stemSubsetData_r->[$i]};
+
+              if($includeStemPrimers == $TRUE)
+              {
+                if($stemLocation < $stemStartAt) { next; }
+                if($stemLocation > $stemEndAt) { last; }
+                next if (abs($innerTm - $stemTm) > $maxDeltaTm);
+              }
+
+              my $middleStartAt = $searchStartAt;
+              my $middleEndAt = $innerLocation - 1 - $minPrimerSpacing;
+              if($middleEndAt < 0) { $middleEndAt = 0; }
+
+              for(my $j = 0; $j < $middleForwardCount; $j++)
+              {
+                my $middleInfo = $middleForwardSubset_r->[$j];
+                my ($middleLocation, $middleLength, $middlePenalty, $midTm) = 
+                  @{$middleForwardSubsetData_r->[$j]};
+
+                if($middleLocation < $middleStartAt) { next; }
+                if($middleLocation > $middleEndAt) { last; }
+
+                if ($includeStemPrimers == $TRUE && $stemTm > 0) {
+                    next if (abs($stemTm - $midTm) > $maxDeltaTm); 
+                } else {
+                    next if (abs($innerTm - $midTm) > $maxDeltaTm);
+                }
+
+                if($middleLocation + $middleLength + $minPrimerSpacing > $innerLocation) { next; }
+
+                my $outerStartAt = $searchStartAt;
+                my $outerEndAt = $middleLocation - 1 - $minPrimerSpacing;
+
+                my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
+                if($innerToMiddleDistance < 0) { $innerToMiddleDistance = 0; }
+
+                for(my $k = 0; $k < $outerForwardCount; $k++)
+                {
+                  my $outerInfo = $outerForwardSubset_r->[$k];
+                  my ($outerLocation, $outerLength, $outerPenalty, $outTm) = 
+                    @{$outerForwardSubsetData_r->[$k]};
+
+                  if($outerLocation < $outerStartAt) { next; }
+                  if($outerLocation > $outerEndAt) { last; }
+                  if($outerLocation + $outerLength + $minPrimerSpacing > $middleLocation) { next; }
+                  next if (abs($midTm - $outTm) > $maxDeltaTm);
+                  if($includeStemPrimers == $TRUE) {
+                    next if (abs($stemTm - $outTm) > $maxDeltaTm);
+                  }
+
+                  my $spacingPenalty = 0;
+                  my $primer3Penalty = 0;
+                  my $detailStr = "";
+
+                  my $middleToOuterDistance = $middleLocation - ($outerLocation + $outerLength);
+                  if($middleToOuterDistance < 0) { $middleToOuterDistance = 0; }
+
+                  if($includeStemPrimers == $TRUE)
+                  {
+                    my $innerToStemDistance = $stemLocation - ($innerLocation + $innerLength);
+                    if($innerToStemDistance < 0) { $innerToStemDistance = 0; }
+
+                    $spacingPenalty = 
+                      ($innerToInnerPenalties_r->[$innerToStemDistance] * $innerToStemPenaltyWeight) +
+                      ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
+                      ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+
+                    $primer3Penalty = 
+                      $innerPenalty * $innerPenaltyWeight +
+                      $stemPenalty * $stemPenaltyWeight +
+                      $middlePenalty * $middlePenaltyWeight +
+                      $outerPenalty * $outerPenaltyWeight;
+
+                    $detailStr = sprintf("Spc[I_S:%.1f I_M:%.1f M_O:%.1f] Thm[I:%.1f S:%.1f M:%.1f O:%.1f]", 
+                          ($innerToInnerPenalties_r->[$innerToStemDistance] * $innerToStemPenaltyWeight),
+                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
+                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                          ($innerPenalty * $innerPenaltyWeight),
+                          ($stemPenalty * $stemPenaltyWeight),
+                          ($middlePenalty * $middlePenaltyWeight),
+                          ($outerPenalty * $outerPenaltyWeight));
+                  }
+                  else
+                  {
+                    $spacingPenalty = 
+                      ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
+                      ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+
+                    $primer3Penalty = 
+                      $innerPenalty * $innerPenaltyWeight +
+                      $middlePenalty * $middlePenaltyWeight +
+                      $outerPenalty * $outerPenaltyWeight;
+
+                    $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
+                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
+                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                          ($innerPenalty * $innerPenaltyWeight),
+                          ($middlePenalty * $middlePenaltyWeight),
+                          ($outerPenalty * $outerPenaltyWeight));
+                  }
+
+                  my $forwardSetPenalty = $spacingPenalty + $primer3Penalty;
+                  if($forwardSetPenalty < $bestSetPenalty)
+                  {
+                    $chunk_infos{$innerIndex} = [$stemInfo, $middleInfo, $outerInfo];
+                    $chunk_penalties{$innerIndex} = [$spacingPenalty, $primer3Penalty, $detailStr];
+                    $bestSetPenalty = $forwardSetPenalty;
+                    $chunk_hits++ unless exists $chunk_infos{$innerIndex};
+                  }
+                } # End forward outer iteration
+              } # End forward middle iteration
+            } # End forward STEM iteration
+        } # End forward inner chunk loop
+        
+        $pm_fwd->finish(0, {
+            infos => \%chunk_infos,
+            penalties => \%chunk_penalties,
+            hits => $chunk_hits,
+            done => $chunk_done,
+        });
+    } # End chunks
+    $pm_fwd->wait_all_children();
+
     printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;
     print "  [Stem Fwd] $forwardSetCount combinaisons Forward trouvees sur $innerForwardCount amorces F1c.\n";
 
@@ -1747,285 +1682,233 @@ sub getOligosWithMismatchTolerance {
     }
 
     print "Scanning Reverse Primer Combinations...\n";
-
     my @bestSigantureForInnerReverse = ();
-
-    # To remember the optimum combination with
-    # 3 columns: STEM, middle, outer
     my @bestReverseInfos = (); 
-    # 2 columns: spacing_penalty, primer3_penalty
     my @bestReversePenalties = ();
+    my $reverseSetCount = 0;
 
-    ## To help short-cut when no possibilities are found
-    #my $reverseSetCount = 0;
-
-    # Barre de progression Flask pour les signatures Reverse / Flask progress bar for Reverse signatures
     my $_sig_rev_t0   = time();
     my $_sig_rev_done = 0;
-    my $_sig_rev_hits = 0;  # Nombre de signatures Reverse trouvees / Reverse signatures found
+    my $_sig_rev_hits = 0;
     print STDERR "  Recherche combinatoire Stem Reverse: $innerReverseCount amorces B1c...\n";
 
-    for(my $innerIndex = 0; $innerIndex < $innerReverseCount; $innerIndex++)
-    {
-      # Emission LAVA-PROGRESS toutes les 50 iterations / Emit LAVA-PROGRESS every 50 iterations
-      $_sig_rev_done = $innerIndex + 1;
-      if ($_sig_rev_done % 50 == 0 || $_sig_rev_done == $innerReverseCount) {
-        if ($_LAVA_IS_TTY || 1) {
-          my $elapsed = time() - $_sig_rev_t0 + 0.001;
-          my $eta = ($_sig_rev_done < $innerReverseCount)
-                    ? int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed))
-                    : 0;
-          my $rate = $_sig_rev_done / $elapsed;
-          printf("[LAVA-PROGRESS] Signatures Stem Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
-                 $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
+    my $pm_rev = LLNL::LAVA::ForkManager->new($options{"threads"});
+    my $num_rev_chunks = $pm_rev->{max_processes} > 1 ? $pm_rev->{max_processes} * 4 : 1;
+    my $rev_chunk_size = int(($innerReverseCount + $num_rev_chunks - 1) / $num_rev_chunks);
+    $rev_chunk_size = 1 if $rev_chunk_size < 1;
+
+    $pm_rev->run_on_finish(sub {
+        my ($pid, $exit_code, $id, $exit_signal, $core_dump, $data_ref) = @_;
+        if (defined $data_ref && ref($data_ref) eq 'HASH') {
+            foreach my $idx (keys %{$data_ref->{infos}}) {
+                if (!defined $bestReverseInfos[$idx]) {
+                    $reverseSetCount++;
+                }
+                $bestReverseInfos[$idx] = $data_ref->{infos}->{$idx};
+                $bestReversePenalties[$idx] = $data_ref->{penalties}->{$idx};
+            }
+            $_sig_rev_hits += $data_ref->{hits} || 0;
+            $_sig_rev_done += $data_ref->{done} || 0;
+            if ($_LAVA_IS_TTY || 1) {
+                my $elapsed = time() - $_sig_rev_t0 + 0.001;
+                my $eta = ($_sig_rev_done < $innerReverseCount)
+                          ? int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed))
+                          : 0;
+                my $rate = $_sig_rev_done / $elapsed;
+                printf("[LAVA-PROGRESS] Signatures Stem Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
+                       $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
+            }
         }
-      }
-      my $innerInfo = $innerReverseSubset_r->[$innerIndex];
-      my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = 
-        @{$innerReverseSubsetData_r->[$innerIndex]};
+    });
 
-      #my $innerLocation = $innerInfo->getLocation();
-      #my $innerLength = $innerInfo->getLength();
+    for (my $chunk_start = 0; $chunk_start < $innerReverseCount; $chunk_start += $rev_chunk_size) {
+        my $chunk_end = $chunk_start + $rev_chunk_size - 1;
+        $chunk_end = $innerReverseCount - 1 if $chunk_end >= $innerReverseCount;
+        
+        $pm_rev->start($chunk_start) and next;
+        
+        my %chunk_infos = ();
+        my %chunk_penalties = ();
+        my $chunk_hits = 0;
+        my $chunk_done = 0;
+        
+        for(my $innerIndex = $chunk_start; $innerIndex <= $chunk_end; $innerIndex++)
+        {
+            $chunk_done++;
+            my $innerInfo = $innerReverseSubset_r->[$innerIndex];
+            my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = 
+              @{$innerReverseSubsetData_r->[$innerIndex]};
 
-      my $bestSetPenalty = 1000000; # Riduculously large starting value
+            my $bestSetPenalty = 1000000;
 
-      # Calculate the first and last base locations to consider for the 
-      # STEM reverse primer (on the plus strand, so need inversion again?)
-      my $searchEndAt = $innerLocation + $signatureMaxLength - 
-	$innerLength - 20; # -20 represents 2 other primer min lengths.
-	
-      # STEM ARCHITECTURE: BSTEM primers are positioned BEFORE inner reverse primer (B1c)
-      # et APRES le F1c. La borne min = B1c_start - innerPairTargetLength/2
-      # BSTEM must lie between the midpoint F1-B1 and B1c
-      my $stemStartAt = $innerLocation - int($innerPairTargetLength / 2);
-      my $stemEndAt   = $innerLocation - $minPrimerSpacing;
-      if($stemStartAt < 0) { $stemStartAt = 0; }
-      if($stemStartAt > $stemEndAt) { $stemStartAt = ($stemEndAt > 50) ? $stemEndAt - 50 : 0; }  # fallback
+            my $searchEndAt = $innerLocation + $signatureMaxLength -
+              $innerLength - 20;
+            my $searchStartAt = $innerLocation + $innerLength +
+              $minPrimerSpacing;
 
-      # If no STEM primers sought, then overwrite the STEM primer list with the
-      # single placeholder, one-length (but ideally zero-length), zero-penalty
-      # STEM primer, placed at the end of the inner primer, to make sure it 
-      # appears to fit within the acceptable locations
-      if($includeStemPrimers == $FALSE)
-      {
-        my $placeHolderPrimer = LLNL::LAVA::Oligo->new(
-	  {
-            "sequence" => "N",
-	    "location" => $stemStartAt - 1, # Extra position to un-do length of 1
-	    "strand" => "plus",
-	  });
-        $placeHolderPrimer->setTag("primer3_penalty", 0);
-        $placeHolderPrimer->setTag("primer3_tm", 0);
+            my $stemStartAt = $innerLocation - int($innerPairTargetLength / 2);
+            if($stemStartAt < 0) { $stemStartAt = 0; }
+            my $stemEndAt = $innerLocation - $minPrimerSpacing;
+            if($stemEndAt < 0) { $stemEndAt = 0; }
 
-        my $placeHolderInfo = LLNL::LAVA::PrimerInfo->new(
-	  { 
-            "penalty" => 0,
-	    "sequence" => $placeHolderPrimer->sequence(),
-	    "location" =>$placeHolderPrimer->location(),
-	    "length" => $placeHolderPrimer->length(),
-	    "analyzed_primer" => $placeHolderPrimer,
-	  });
+            my $curr_stemSubset_r = $stemReverseSubset_r;
+            my $curr_stemSubsetData_r = $stemReverseSubsetData_r;
+            my $curr_stemCount = $stemReverseCount;
 
-        $stemReverseSubset_r = [$placeHolderInfo];
-        $stemReverseSubsetData_r = [[$stemEndAt + 1, 1, 0]]; # [location, length, penalty]
-	$stemReverseCount = 1; 
-      }
-
-      # Start of the 3-level nested loop for reverse primers.
-      # Should  exhaustively iterate over STEM, middle, outer 
-      # combinations based on the inner pair
-      for(my $i = 0; $i < $stemReverseCount; $i++)
-      {
-	my $stemInfo = $stemReverseSubset_r->[$i];
-	my ($stemLocation, $stemLength, $stemPenalty, $stemTm) = 
-	  @{$stemReverseSubsetData_r->[$i]};
-
-        #my $stemLocation = $stemInfo->getLocation();
-        #my $stemLength = $stemInfo->getLength();
-
-	# Special inversion for STEM primer, because reverse STEM primer was
-	# designed on the minus strand.
-	
-        # Seek to the first STEM primer within range 
-	# but, accept placeholder STEM primer
-        if($stemLocation < $stemStartAt &&
-	   $stemLength != 1)
-	{
-	  next;
-	}
-
-	# Stop when STEM primer goes out of range	
-	if($stemLocation > $stemEndAt &&
-	   $stemLength != 1)
-	{
-	  last;
-	}
-
-        #print "L";
-
-        # No check for STEM->inner overlap because stemStartAt is the location limiter
-
-	# STEM ARCHITECTURE: Middle primers are positioned independently of STEM primers  
-	# since STEM primers are now between inner forward and reverse primers
-        my $middleStartAt = $innerLocation + $minPrimerSpacing;
-        my $middleEndAt = $searchEndAt;
-
-        # STEM ARCHITECTURE: Calculate distance from STEM back to inner reverse  
-	my $innerToStemDistance = ($innerLocation - $innerLength) - ($stemLocation + $stemLength);
-        # Ensure distance is non-negative
-        if($innerToStemDistance < 0) { $innerToStemDistance = 0; }
-
-        # --- DYNAMIC THERMAL FILTER (Stem vs Inner) ---
-        if ($includeStemPrimers == $TRUE && $stemTm > 0) {
-            next if (abs($innerTm - $stemTm) > $maxDeltaTm);
-        }
-
-        for(my $j = 0; $j < $middleReverseCount; $j++)
-	{
-	  my $middleInfo = $middleReverseSubset_r->[$j];
-	  my ($middleLocation, $middleLength, $middlePenalty, $midTm) = 
-	    @{$middleReverseSubsetData_r->[$j]};
-
-          #my $middleLocation = $middleInfo->getLocation();
-          #my $middleLength = $middleInfo->getLength();
-
-	  # Seek to the first middle primer within range
-	  if($middleLocation < $middleStartAt)
-	  {
-	    next;
-	  }
-
-	  # Stop when middle primer goes out of range
-	  if($middleLocation > $middleEndAt)
-	  {
-	    last;
-	  }
-
-          # Progression : itération Middle reverse (debug retiré / debug removed)
-          
-          # --- DYNAMIC THERMAL FILTER ---
-          if ($includeStemPrimers == $TRUE && $stemTm > 0) {
-              next if (abs($stemTm - $midTm) > $maxDeltaTm);
-          } else {
-              next if (abs($innerTm - $midTm) > $maxDeltaTm);
-          }
-
-          # STEM ARCHITECTURE: Only check spacing between middle and inner primers
-	  # STEM primers are no longer between middle and inner  
-          if($middleLocation - $middleLength - $minPrimerSpacing < $innerLocation)
-          {
-            next;
-	  }
-
-          my $outerStartAt = $middleLocation + 1 + $minPrimerSpacing;
-          my $outerEndAt = $searchEndAt;
-
-
-          for(my $k = 0; $k < $outerReverseCount; $k++)
-	  {
-	    my $outerInfo = $outerReverseSubset_r->[$k];
-	    my ($outerLocation, $outerLength, $outerPenalty, $outTm) = 
-	      @{$outerReverseSubsetData_r->[$k]};
-
-	    #my $outerLocation = $outerInfo->getLocation();
-            #my $outerLength = $outerInfo->getLength();
- 
-            # Seek to first outer primer within range
-	    if($outerLocation < $outerStartAt)
-	    {
-	      next;
-	    }
-
-	    # Stop when outer primer goes out of range
-	    if($outerLocation > $outerEndAt)
-	    {
-              last;
-	    }
-
-            #print "O";
-            
-            # --- DYNAMIC THERMAL FILTER ---
-            next if (abs($midTm - $outTm) > $maxDeltaTm);
-
-            # Next primer if this outer doesn't leave enough spacing to the middle primer
-	    if($outerLocation - $outerLength - $minPrimerSpacing <
-	       $middleLocation)
-	    {
-	      next;
-	    }
-
-	    # Inter-primer distance used for calculating spacing penalty
-            # Calculate distances for reverse primers
-            my $middleToOuterDistance = ($outerLocation - $outerLength) - $middleLocation;
-            if($middleToOuterDistance < 0) { $middleToOuterDistance = 0; }
-            my $innerToMiddleDistance = ($middleLocation - $middleLength) - ($innerLocation + 1);
-            if($innerToMiddleDistance < 0) { $innerToMiddleDistance = 0; }
-            
-            my $spacingPenalty = 0;
-            my $primer3Penalty = 0;
-            my $detailStr = "";
-            # Clamper les distances au max des tableaux de penalites / Clamp distances to max penalty array index
-            my $maxPenIdx_r = $signatureMaxLength - 1;
-            my $d_stem_r   = ($innerToStemDistance   < $maxPenIdx_r) ? $innerToStemDistance   : $maxPenIdx_r;
-            my $d_middle_r = ($innerToMiddleDistance < $maxPenIdx_r) ? $innerToMiddleDistance : $maxPenIdx_r;
-            my $d_outer_r  = ($middleToOuterDistance < $maxPenIdx_r) ? $middleToOuterDistance : $maxPenIdx_r;
-
-            if($includeStemPrimers == $TRUE)
+            if($includeStemPrimers == $FALSE)
             {
-              # STEM ARCHITECTURE: Calculate spacing between inner-STEM and inner-middle
-              $spacingPenalty = 
-                ($innerToLoopPenalties_r->[$d_stem_r]    * $innerToStemPenaltyWeight) +
-                ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight);
-              $primer3Penalty = 
-                $innerPenalty * $innerPenaltyWeight +
-                $stemPenalty  * $stemPenaltyWeight +
-                $middlePenalty * $middlePenaltyWeight +
-                $outerPenalty * $outerPenaltyWeight;
-              
-              $detailStr = sprintf("Spc[I_S:%.1f I_M:%.1f M_O:%.1f] Thm[I:%.1f S:%.1f M:%.1f O:%.1f]",
-                    ($innerToLoopPenalties_r->[$d_stem_r]    * $innerToStemPenaltyWeight),
-                    ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight),
-                    ($innerPenalty * $innerPenaltyWeight),
-                    ($stemPenalty  * $stemPenaltyWeight),
-                    ($middlePenalty * $middlePenaltyWeight),
-                    ($outerPenalty * $outerPenaltyWeight));
-            }
-            else
-            {
-              $spacingPenalty = 
-                ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight) +
-                ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight);
-              $primer3Penalty = 
-                $innerPenalty * $innerPenaltyWeight +
-                $middlePenalty * $middlePenaltyWeight +
-                $outerPenalty * $outerPenaltyWeight;
-              
-              $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]",
-                    ($innerToMiddlePenalties_r->[$d_middle_r] * $innerToMiddlePenaltyWeight),
-                    ($middleToOuterPenalties_r->[$d_outer_r]  * $middleToOuterPenaltyWeight),
-                    ($innerPenalty * $innerPenaltyWeight),
-                    ($middlePenalty * $middlePenaltyWeight),
-                    ($outerPenalty * $outerPenaltyWeight));
-            }
- 
-            my $reverseSetPenalty = $spacingPenalty + $primer3Penalty;
-            if($reverseSetPenalty < $bestSetPenalty)
-            {
-              $bestReverseInfos[$innerIndex] = [$stemInfo, $middleInfo, $outerInfo];
-              $bestSetPenalty = $reverseSetPenalty;
-              $_sig_rev_hits++;  # Compteur de signatures Rev / Rev signature counter
-              $bestReversePenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
-            }
-          } # End reverse outer iteration
-        } # End reverse middle iteration
-      } # End reverse STEM iteration
-    } # End reverse inner iteration
+              my $placeHolderPrimer = LLNL::LAVA::Oligo->new(
+                {
+                  "sequence" => "N",
+                  "location" => $stemStartAt - 1,
+                  "strand" => "plus",
+                });
+              $placeHolderPrimer->setTag("primer3_penalty", 0);
+              $placeHolderPrimer->setTag("primer3_tm", 0);
 
-    # Finaliser la barre Reverse / Finalize Reverse bar
+              my $placeHolderInfo = LLNL::LAVA::PrimerInfo->new(
+                {
+                  "penalty" => 0,
+                  "sequence" => $placeHolderPrimer->sequence(),
+                  "location" => $placeHolderPrimer->location(),
+                  "length" => $placeHolderPrimer->length(),
+                  "analyzed_primer" => $placeHolderPrimer,
+                });
+
+              $curr_stemSubset_r = [$placeHolderInfo];
+              $curr_stemSubsetData_r = [[$stemStartAt - 1, 1, 0, 0]];
+              $curr_stemCount = 1;
+            }
+
+            for(my $i = 0; $i < $curr_stemCount; $i++)
+            {
+              my $stemInfo = $curr_stemSubset_r->[$i];
+              my ($stemLocation, $stemLength, $stemPenalty, $stemTm) = 
+                @{$curr_stemSubsetData_r->[$i]};
+
+              if($includeStemPrimers == $TRUE)
+              {
+                if($stemLocation < $stemStartAt) { next; }
+                if($stemLocation > $stemEndAt) { last; }
+                next if (abs($innerTm - $stemTm) > $maxDeltaTm);
+              }
+
+              my $middleStartAt = $searchStartAt;
+              my $middleEndAt = $searchEndAt;
+
+              for(my $j = 0; $j < $middleReverseCount; $j++)
+              {
+                my $middleInfo = $middleReverseSubset_r->[$j];
+                my ($middleLocation, $middleLength, $middlePenalty, $midTm) = 
+                  @{$middleReverseSubsetData_r->[$j]};
+
+                if($middleLocation < $middleStartAt) { next; }
+                if($middleLocation > $middleEndAt) { last; }
+
+                if ($includeStemPrimers == $TRUE && $stemTm > 0) {
+                    next if (abs($stemTm - $midTm) > $maxDeltaTm); 
+                } else {
+                    next if (abs($innerTm - $midTm) > $maxDeltaTm);
+                }
+
+                if($innerLocation + $innerLength + $minPrimerSpacing > $middleLocation - $middleLength) { next; }
+
+                my $outerStartAt = $searchStartAt;
+                my $outerEndAt = $searchEndAt;
+
+                my $innerToMiddleDistance = ($middleLocation - $middleLength) - $innerLocation;
+                if($innerToMiddleDistance < 0) { $innerToMiddleDistance = 0; }
+
+                for(my $k = 0; $k < $outerReverseCount; $k++)
+                {
+                  my $outerInfo = $outerReverseSubset_r->[$k];
+                  my ($outerLocation, $outerLength, $outerPenalty, $outTm) = 
+                    @{$outerReverseSubsetData_r->[$k]};
+
+                  if($outerLocation < $outerStartAt) { next; }
+                  if($outerLocation > $outerEndAt) { last; }
+                  if($middleLocation + $minPrimerSpacing > $outerLocation - $outerLength) { next; }
+                  next if (abs($midTm - $outTm) > $maxDeltaTm);
+                  if($includeStemPrimers == $TRUE) {
+                    next if (abs($stemTm - $outTm) > $maxDeltaTm);
+                  }
+
+                  my $spacingPenalty = 0;
+                  my $primer3Penalty = 0;
+                  my $detailStr = "";
+
+                  my $middleToOuterDistance = ($outerLocation - $outerLength) - $middleLocation;
+                  if($middleToOuterDistance < 0) { $middleToOuterDistance = 0; }
+
+                  if($includeStemPrimers == $TRUE)
+                  {
+                    my $innerToStemDistance = $innerLocation - ($stemLocation + $stemLength);
+                    if($innerToStemDistance < 0) { $innerToStemDistance = 0; }
+
+                    $spacingPenalty = 
+                      ($innerToInnerPenalties_r->[$innerToStemDistance] * $innerToStemPenaltyWeight) +
+                      ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
+                      ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+
+                    $primer3Penalty = 
+                      $innerPenalty * $innerPenaltyWeight +
+                      $stemPenalty * $stemPenaltyWeight +
+                      $middlePenalty * $middlePenaltyWeight +
+                      $outerPenalty * $outerPenaltyWeight;
+
+                    $detailStr = sprintf("Spc[I_S:%.1f I_M:%.1f M_O:%.1f] Thm[I:%.1f S:%.1f M:%.1f O:%.1f]", 
+                          ($innerToInnerPenalties_r->[$innerToStemDistance] * $innerToStemPenaltyWeight),
+                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
+                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                          ($innerPenalty * $innerPenaltyWeight),
+                          ($stemPenalty * $stemPenaltyWeight),
+                          ($middlePenalty * $middlePenaltyWeight),
+                          ($outerPenalty * $outerPenaltyWeight));
+                  }
+                  else
+                  {
+                    $spacingPenalty = 
+                      ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
+                      ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
+
+                    $primer3Penalty = 
+                      $innerPenalty * $innerPenaltyWeight +
+                      $middlePenalty * $middlePenaltyWeight +
+                      $outerPenalty * $outerPenaltyWeight;
+
+                    $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
+                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
+                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
+                          ($innerPenalty * $innerPenaltyWeight),
+                          ($middlePenalty * $middlePenaltyWeight),
+                          ($outerPenalty * $outerPenaltyWeight));
+                  }
+
+                  my $reverseSetPenalty = $spacingPenalty + $primer3Penalty;
+                  if($reverseSetPenalty < $bestSetPenalty)
+                  {
+                    $chunk_infos{$innerIndex} = [$stemInfo, $middleInfo, $outerInfo];
+                    $chunk_penalties{$innerIndex} = [$spacingPenalty, $primer3Penalty, $detailStr];
+                    $bestSetPenalty = $reverseSetPenalty;
+                    $chunk_hits++ unless exists $chunk_infos{$innerIndex};
+                  }
+                } # End reverse outer iteration
+              } # End reverse middle iteration
+            } # End reverse STEM iteration
+        } # End reverse inner chunk loop
+        
+        $pm_rev->finish(0, {
+            infos => \%chunk_infos,
+            penalties => \%chunk_penalties,
+            hits => $chunk_hits,
+            done => $chunk_done,
+        });
+    } # End chunks
+    $pm_rev->wait_all_children();
+
     printf(STDERR "\r%-80s\n", "") if $_LAVA_IS_TTY;
     print "  [Stem Rev] $_sig_rev_hits combinaisons Reverse trouvees sur $innerReverseCount amorces B1c.\n";
+
 
     ## Stop trying if no reverse primer sets were found (probably an un-needed optimization)
     #if($reverseSetCount == 0)
