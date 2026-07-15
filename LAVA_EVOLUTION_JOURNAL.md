@@ -1539,3 +1539,29 @@ Les pipelines bioinformatiques exposés sur un serveur web clinique doivent gara
 
 **Impact attendu** :
 Une sécurité logicielle de niveau production : étanchéité totale face aux injections de paramètres illégitimes et aux surcharges serveur, sans altérer l'expérience utilisateur lors de l'import de fichiers de paramètres légitimes.
+
+---
+
+### [2026-07-15] Parallélisation Multi-Cœurs du Moteur Combinatoire LAVA (Option B)
+
+**Date/Étape** : 2026-07-15 - Parallélisation multi-processus native des boucles combinatoires via `Parallel::ForkManager`.
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/ForkManager.pm` (nouveau module d'encapsulation multi-cœurs)
+- `lava_loop_primer.pl` (parallélisation des boucles combinatoires Forward et Reverse, option `--threads|cpu`)
+- `lava_stem_primer.pl` (parallélisation des boucles combinatoires Stem Forward et Stem Reverse, option `--threads|cpu`)
+
+**Nature du changement** : [Algorithmique / Architecture / Performance]
+
+**Explication technique** :
+1. **Implémentation du module `LLNL::LAVA::ForkManager` (Option B)** : Création d'un module Perl interne gérant dynamiquement la concurrence multi-cœurs. Si le module CPAN `Parallel::ForkManager` est disponible sur l'hôte, le moteur exploite le multi-processus POSIX nativement. Si le module n'est pas installé, un mode dégradé séquentiel ultra-léger garantit la portabilité sans erreur de compilation.
+2. **Découpage en Chunks et Copy-On-Write (COW)** : Au lieu d'utiliser le module natif `threads` de Perl (sujet à de lourdes fuites mémoire avec BioPerl et déconseillé en bioinformatique intensive), l'architecture sépare l'espace de recherche en sous-ensembles (chunks) d'amorces (`$chunk_start` à `$chunk_end`). Chaque processus enfant hérite instantanément des tables de pénalités en lecture seule grâce au mécanisme de mémoire partagée *Copy-On-Write* du noyau Unix.
+3. **Agrégation Déterministe et Filtrage Thermodynamique** : À la fin de chaque sous-processus (`run_on_finish`), le processus parent agrège les meilleures combinaisons d'amorces (`$bestForwardInfos`, `$bestForwardPenalties`, `$bestReverseInfos`, `$bestReversePenalties`) et additionne les compteurs de signatures (`$_sig_fwd_hits`, `$_sig_rev_hits`).
+4. **Interface CLI `--threads|cpu`** : Ajout du paramètre `--threads|cpu` (valeur par défaut : `auto` configurée sur `LLNL::LAVA::ForkManager->_auto_cpus()`), permettant à l'utilisateur ou à l'interface web d'allouer précisément le nombre de cœurs de calcul ou de laisser le moteur adapter automatiquement sa charge au processeur de la machine.
+
+**Justification biologique** :
+L'évaluation combinatoire exhaustive (recherche d'intersections et minimisation des pénalités sigmoïdes de distance et d'énergie d'hybridation sur l'ensemble des amorces F1c, F2, F3, B1c, B2, B3 et Stem) implique le parcours de plusieurs centaines de milliers à plusieurs millions de combinaisons thermodynamiques (`inner × stem × middle × outer`). Sur des génomes viraux très riches en variants (comme la Dengue ou le SARS-CoV-2), la recherche séquentielle pouvait nécessiter plusieurs heures de calcul. La parallélisation distribue cette évaluation cinétique sur tous les cœurs disponibles, maintenant rigoureusement les mêmes critères de sélectivité (`maxDeltaTm`, `minPrimerSpacing`, `signatureMaxLength`) sans perte de candidats.
+
+**Impact attendu** :
+Réduction drastique du temps d'exécution (accélération quasi-linéaire selon le nombre de cœurs alloués, passant de plusieurs heures à quelques minutes ou secondes sur les jeux d'amorces complexes), tout en garantissant une stricte reproductibilité des signatures LAMP et une stabilité mémoire absolue de l'application serveur LAVA.
+
