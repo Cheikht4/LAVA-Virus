@@ -1565,3 +1565,29 @@ L'évaluation combinatoire exhaustive (recherche d'intersections et minimisation
 **Impact attendu** :
 Réduction drastique du temps d'exécution (accélération quasi-linéaire selon le nombre de cœurs alloués, passant de plusieurs heures à quelques minutes ou secondes sur les jeux d'amorces complexes), tout en garantissant une stricte reproductibilité des signatures LAMP et une stabilité mémoire absolue de l'application serveur LAVA.
 
+---
+
+### [2026-07-15] Parallélisation Multi-Cœurs et Centralisation de la Validation des Amorces (PipelineUtils)
+
+**Date/Étape** : 2026-07-15 - Parallélisation multi-processus de la tolérance aux mésappariements (`checkPrimerMismatchTolerance`) dans `getOligosWithMismatchTolerance` et `buildNativeReversePool`.
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/PipelineUtils.pm` (centralisation et parallélisation de `getOligosWithMismatchTolerance` et `buildNativeReversePool`)
+- `lava_loop_primer.pl` (import de `getOligosWithMismatchTolerance` et appel automatique de `set_pipeline_threads`)
+- `lava_stem_primer.pl` (import de `getOligosWithMismatchTolerance` et appel automatique de `set_pipeline_threads`)
+
+**Nature du changement** : [Algorithmique / Architecture / Performance]
+
+**Explication technique** :
+1. **Centralisation de la Validation dans PipelineUtils.pm** : Extraction et harmonisation de la fonction `getOligosWithMismatchTolerance` de `lava_loop_primer.pl` et `lava_stem_primer.pl` vers le module central `lib/LLNL/LAVA/PipelineUtils.pm`. Élimination des redondances algorithmiques entre les deux modes.
+2. **Parallélisation Chunk-Based via ForkManager** : Application de `LLNL::LAVA::ForkManager` au processus de criblage et de validation des amorces (`checkPrimerMismatchTolerance`) dans `getOligosWithMismatchTolerance` (brin plus / Forward) et `buildNativeReversePool` (brin moins / Reverse). Le pool de candidats généré par Primer3 est découpé de manière équilibrée en lots (*chunks*) distribués sur le pool de processus enfants.
+3. **Agrégation des Métriques et Tri Déterminé** : Les processus enfants transmettent leurs amorces validées (strictes ou dégénérées), leurs statistiques et leurs logs de criblage dans un dictionnaire de retour agrégé par `run_on_finish`. Un tri final stable sur la position génomique (`location`) puis sur la longueur (`length`) garantit l'invariance absolue des résultats entre une exécution séquentielle et une exécution parallèle sur $N$ cœurs.
+4. **Synchronisation Dynamique du Pool de Threads** : Ajout de la routine `set_pipeline_threads` dans `PipelineUtils.pm` pour synchroniser globalement le nombre de cœurs alloués avec l'option CLI `--threads|cpu` ou les requêtes Flask transmises depuis l'interface utilisateur.
+
+**Justification biologique** :
+L'évaluation de la tolérance aux mésappariements sur les alignements viraux massifs exige de confronter chaque oligonucléotide candidat (souvent plusieurs milliers par type d'amorce F3, F2, F1c, B1c, B2, B3) contre l'intégralité des séquences du Multiple Sequence Alignment (MSA). Pour chaque amorce et chaque variant, l'algorithme vérifie l'intégrité absolue de la zone 3' critique (site d'initiation de la polymérase) tout en quantifiant la couverture IUPAC et les mutations en 5'/milieu. Cette opération, hautement intensive en calculs de chaînes de caractères et en comptages d'entropie de Shannon, constituait un goulot d'étranglement majeur avant l'étape de combinatoire. Sa distribution sur l'ensemble des cœurs accélère le filtrage initial de l'espace des séquences, permettant l'analyse interactive de panels viraux très profonds sans sacrifier la rigueur de la validation cinétique.
+
+**Impact attendu** :
+Accélération spectaculaire de la phase initiale de validation et de génération des amorces candidates sur l'ensemble des modes (`LOOP` et `STEM`), avec un temps de criblage divisé proportionnellement au nombre de processeurs disponibles sur l'hôte, tout en assurant une architecture logicielle centralisée et propre.
+
+
