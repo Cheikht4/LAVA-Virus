@@ -1645,4 +1645,31 @@ La validation thermodynamique des amorces LAMP à l'échelle d'alignements compl
 - Fonctionnement fluide et garanti de 5 analyses LAMP simultanées sans contention ni dégradation de performance.
 - Robustesse totale du moteur Perl autonome (`ForkManager`) face aux saisies aberrantes en ligne de commande (`--threads 500` ou `--threads abc`).
 
+---
+
+### Date/Étape : 2026-07-15 - Correction et fluidification du suivi de progression en temps réel (Autoflush et Granularité ForkManager)
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/PipelineUtils.pm`
+- `lava_stem_primer.pl`
+- `lava_loop_primer.pl`
+
+**Nature du changement** : [Bug Fix / Algorithmique / Architecture]
+
+**Explication technique** :
+1. **Suppression du tampon de bloc C/Perl (`$| = 1;`)** :
+   - Lorsque le moteur Perl est invoqué par l'interface Flask via `subprocess.Popen` (tube de communication standard non-TTY), la bibliothèque C sous-jacente active par défaut un tamponnage par blocs (`block buffering` de 8 Ko). En conséquence, les messages de progression `[LAVA-PROGRESS]` restaient capturés en mémoire morte dans le tampon du processus Perl et n'étaient vidés vers l'application Python qu'à l'achèvement final du pipeline, provoquant un saut brutal de la barre de 0% à 100%.
+   - L'activation systématique de l'autoflush (`$| = 1;`) dans `PipelineUtils.pm`, `lava_stem_primer.pl` et `lava_loop_primer.pl`, couplée à un vidage explicite (`select(STDOUT); $| = 1;`) après chaque `printf("[LAVA-PROGRESS] ...")`, force le canal STDOUT à transmettre instantanément chaque mise à jour vers le contrôleur Flask.
+2. **Optimisation de la granularité de parallélisation (`$n_chunks`)** :
+   - Les boucles de validation thermodynamique (`getOligosWithMismatchTolerance`) et les boucles combinatoires (`lava_stem_primer.pl`, `lava_loop_primer.pl`) sous `LLNL::LAVA::ForkManager` découpaient auparavant l'espace de recherche en un nombre de lots strictement égal à `max_processes` (ou à un lot unique en mode mono-processeur). La notification `run_on_finish` n'étant émise par le processus parent qu'à la terminaison de chaque lot, le suivi restait figé pendant de longues périodes.
+   - Le coefficient de granularité a été multiplié par un facteur 12 (`max_processes * 12` avec un seuil minimal de 25 à 30 lots de travail). Ce découpage fin garantit que les sous-processus retournent continuellement des lots partiels validés à cadence régulière.
+
+**Justification biologique** :
+Lors du design d'amorces LAMP sur des génomes viraux complets ou très polymorphes, l'exploration combinatoire des distances inter-amorces (F3-B3, F1c-B1c, boucles et tiges) implique le test de dizaines de milliers de quadruplets et sextuplets oligonucléotidiques. Pour le bioinformaticien, une barre de progression figée à 0% ou ne se chargeant qu'en toute fin d'analyse génère une ambiguïté sur l'état du serveur (suspicion de blocage infini, de boucle morte ou d'épuisement mémoire). La restitution fluide de la cinétique de criblage permet au scientifique de surveiller l'avancement réel du filtrage thermodynamique, d'anticiper le temps d'attente (ETA précis) et de valider la réactivité de la grappe de calcul.
+
+**Impact attendu** :
+- Affichage continu, précis et en temps réel de la barre de progression sur l'interface de surveillance Web (`monitor.html`).
+- Fin définitive de la latence visuelle et du chargement instantané à 100% en fin d'exécution.
+- Fluidité de suivi garantie à la fois en exécution monocoq (`threads=1`) et en parallélisation intensive multicoq.
+
 
