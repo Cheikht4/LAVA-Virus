@@ -73,6 +73,7 @@ use strict;
 use Time::HiRes qw(time);
 use warnings;
 use Carp;
+$| = 1;  # Autoflush STDOUT pour l'envoi en temps réel vers Flask
 use lib 'lib';
 
 use Getopt::Long;
@@ -1296,7 +1297,9 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     print STDERR "  Recherche combinatoire Stem Forward: $innerForwardCount amorces F1c...\n";
 
     my $pm_fwd = LLNL::LAVA::ForkManager->new($options{"threads"});
-    my $num_fwd_chunks = $pm_fwd->{max_processes} > 1 ? $pm_fwd->{max_processes} * 4 : 1;
+    my $num_fwd_chunks = $pm_fwd->{max_processes} * 12;
+    $num_fwd_chunks = 30 if $num_fwd_chunks < 30;
+    $num_fwd_chunks = $innerForwardCount if $num_fwd_chunks > $innerForwardCount;
     my $fwd_chunk_size = int(($innerForwardCount + $num_fwd_chunks - 1) / $num_fwd_chunks);
     $fwd_chunk_size = 1 if $fwd_chunk_size < 1;
 
@@ -1320,6 +1323,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
                 my $rate = $_sig_fwd_done / $elapsed;
                 printf("[LAVA-PROGRESS] Signatures Stem Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
                        $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
+                my $old_h = select(STDOUT); $| = 1; select($old_h);
             }
         }
     });
@@ -1531,7 +1535,9 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     print STDERR "  Recherche combinatoire Stem Reverse: $innerReverseCount amorces B1c...\n";
 
     my $pm_rev = LLNL::LAVA::ForkManager->new($options{"threads"});
-    my $num_rev_chunks = $pm_rev->{max_processes} > 1 ? $pm_rev->{max_processes} * 4 : 1;
+    my $num_rev_chunks = $pm_rev->{max_processes} * 12;
+    $num_rev_chunks = 30 if $num_rev_chunks < 30;
+    $num_rev_chunks = $innerReverseCount if $num_rev_chunks > $innerReverseCount;
     my $rev_chunk_size = int(($innerReverseCount + $num_rev_chunks - 1) / $num_rev_chunks);
     $rev_chunk_size = 1 if $rev_chunk_size < 1;
 
@@ -1555,6 +1561,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
                 my $rate = $_sig_rev_done / $elapsed;
                 printf("[LAVA-PROGRESS] Signatures Stem Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
                        $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
+                my $old_h = select(STDOUT); $| = 1; select($old_h);
             }
         }
     });

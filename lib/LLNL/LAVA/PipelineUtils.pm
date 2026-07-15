@@ -23,6 +23,7 @@ package LLNL::LAVA::PipelineUtils;
 use strict;
 use warnings;
 use Carp;
+$| = 1;  # Autoflush STDOUT pour un envoi en temps réel des logs et de la progression vers Flask
 
 use Exporter 'import';
 our @EXPORT_OK = qw(
@@ -157,6 +158,7 @@ sub _update_progress {
   printf("[LAVA-PROGRESS] %s|%d|%d|%s|%s|%d\n",
          $bar_r->{label} // 'Reverse Validation', $done, $total,
          $extra_str, $rate_str, $eta_val);
+  my $old_handle = select(STDOUT); $| = 1; select($old_handle);
 }
 
 sub _finish_progress {
@@ -276,7 +278,8 @@ sub getOligosWithMismatchTolerance {
 
   my $fwd_progress = _make_progress_bar($nb_fwd_candidates, $progress_label);
   my $pm = LLNL::LAVA::ForkManager->new($num_threads);
-  my $n_chunks = ($pm->{max_processes} > 1) ? $pm->{max_processes} : 1;
+  my $n_chunks = $pm->{max_processes} * 12;
+  $n_chunks = 25 if $n_chunks < 25;
   $n_chunks = $nb_fwd_candidates if $n_chunks > $nb_fwd_candidates;
 
   $pm->run_on_finish(sub {
@@ -465,7 +468,8 @@ sub buildNativeReversePool {
 
   my $rev_progress = _make_progress_bar($nb_rev_candidates, $progress_label);
   my $pm = LLNL::LAVA::ForkManager->new($num_threads);
-  my $n_chunks = ($pm->{max_processes} > 1) ? $pm->{max_processes} : 1;
+  my $n_chunks = $pm->{max_processes} * 12;
+  $n_chunks = 25 if $n_chunks < 25;
   $n_chunks = $nb_rev_candidates if $n_chunks > $nb_rev_candidates;
 
   $pm->run_on_finish(sub {
