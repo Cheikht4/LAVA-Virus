@@ -90,7 +90,7 @@ use LLNL::LAVA::PrimerSetInfo::PCRPair;
 use LLNL::LAVA::PrimerSet::LAMP;
 use LLNL::LAVA::Core qw(generateDistancePenalties calculate_proportional_geometry generateSigmoidPenalty countDegenerateBases);
 use LLNL::LAVA::Validator qw(checkPrimerMismatchTolerance getPrimerTargetedSequences isIUPACCompatible rev_comp generateIUPACCode validateCompleteSignatureSpacing);
-use LLNL::LAVA::PipelineUtils qw(buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths); # buildReversePrimers retiré (DEPRECATED, remplacé par buildNativeReversePool)
+use LLNL::LAVA::PipelineUtils qw(getOligosWithMismatchTolerance set_pipeline_threads buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths); # buildReversePrimers retiré (DEPRECATED, remplacé par buildNativeReversePool)
 use LLNL::LAVA::ForkManager;
 
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
@@ -104,7 +104,6 @@ STDERR->autoflush(1);
 # Detect interactive terminal: in-place bar if TTY, silent if redirected to file
 our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
 
-
 ################################################################################
 # FONCTIONS DE VALIDATION ET D'ANALYSE DES SIGNATURES
 # Ces fonctions sont desormais dans LLNL::LAVA::PipelineUtils (Phase 36).
@@ -116,161 +115,6 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
 #   - createAmplificationFiles
 #   - calculateDynamicPairLengths
 ################################################################################
-=head2 getOligosWithMismatchTolerance
-
-Version améliorée de getOligos qui intègre la tolérance aux mismatches. / Improved version of getOligos that integrates mismatch tolerance.
-
-=cut
-
-sub getOligosWithMismatchTolerance {
-  my ($enumerator, $alignment, $min_match_percent, $min_iupac_percent, $min_primer_coverage,
-      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, $label) = @_;
-  
-  $label //= "Forward";
-  my $progress_label = "Validation $label";
-  
-  my $sequenceCount = $alignment->num_sequences();
-  if ($sequenceCount <= 0) {
-    confess("data error - MSA must contain at least one sequence");
-  }
-  
-  print "INFO: Utilisation de la tolérance aux mismatches activée\n";
-  print "  - Seuil de concordance stricte / Strict match threshold: ${min_match_percent}%\n";
-  print "  - Seuil de couverture IUPAC / IUPAC coverage threshold: ${min_iupac_percent}%\n";
-  
-  my @sequences = ();
-  foreach my $sequence ($alignment->each_seq()) {
-    my $seqContent = $sequence->seq();
-    $seqContent = uc($seqContent);  # Convertir en majuscules d'abord / Convert to uppercase first
-    $seqContent =~ s/[^ATCG]/N/g;  # Puis normaliser (remplacer caractères non-ADN par N) / Then normalize (replace non-DNA characters with N)
-    push @sequences, $seqContent;
-  }
-  
-  my @candidatePrimers = $enumerator->getOligos($alignment);
-  my @validatedPrimers = ();
-  my $strict_count = 0;
-  my $degenerate_count = 0;
-  my $rejected_count = 0;
-  
-  my $nb_fwd_candidates = scalar(@candidatePrimers);
-  print "INFO: Analyse de $nb_fwd_candidates amorces candidates Forward avec tolerance aux mismatches...\n";
-
-  # Barre de progression / Progress bar (auto-detect Term::ProgressBar ou ASCII fallback)
-  my $_has_pb = eval { require Term::ProgressBar; 1 } || 0;
-  my $_pb_obj = undef;
-  my $_pb_t0  = time();
-  if ($_has_pb && -t STDOUT) {
-    $_pb_obj = Term::ProgressBar->new({
-      name   => $progress_label,
-      count  => $nb_fwd_candidates,
-      ETA    => 'linear',
-      remove => 0,
-      fh     => \*STDERR,
-    });
-    $_pb_obj->minor(0);
-  }
-  my $_pb_done = 0;
-
-  foreach my $primer (@candidatePrimers) {
-    my $location = $primer->location();
-    my $length = $primer->length();
-    my $original_sequence = $primer->sequence();
-    
-    my ($final_sequence, $coverage_percent, $is_degenerate, $compatible_seq_ids) = 
-      checkPrimerMismatchTolerance(\@sequences, $location, $length, $original_sequence,
-                                  $min_match_percent, $min_iupac_percent, $min_primer_coverage,
-                                  $maxTotalDegen, $maxConsecDegen, 
-                                  $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
-    
-    # Utiliser le même seuil que l'algorithme interne (paramètre passé à la fonction) / Use the same threshold as the internal algorithm (parameter passed to the function)
-    my $min_primer_acceptance = $min_primer_coverage;
-    if ($coverage_percent >= $min_primer_acceptance) {
-      my $validatedPrimer = $primer->clone();
-      
-      if ($is_degenerate) {
-        $validatedPrimer->sequence($final_sequence);
-        $validatedPrimer->setTag("is_degenerate", 1);
-        $validatedPrimer->setTag("original_sequence", $original_sequence);
-        $validatedPrimer->setTag("iupac_coverage", sprintf("%.1f", $coverage_percent));
-        $validatedPrimer->setTag("compatible_sequence_ids", $compatible_seq_ids);
-        $degenerate_count++;
-        
-        print "DEGENERATE PRIMER acceptée - Pos: $location, Couv: " . 
-              sprintf("%.1f", $coverage_percent) . "%, Seq: $final_sequence\n";
-        # Mise à jour barre / Update progress bar
-        $_pb_done++;
-        if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
-        elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          # Ligne de progression structuree pour Flask / Structured progress line for Flask
-          if ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-            my $pct = int($_pb_done/$nb_fwd_candidates*100);
-            my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                      ? int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001)))
-                      : 0;
-            my $rate = $_pb_done / (time()-$_pb_t0+0.001);
-            printf("[LAVA-PROGRESS] %s|%d|%d|OK:%d DEG:%d REJ:%d|%.0f it/s|%d\n",
-                   $progress_label,$_pb_done,$nb_fwd_candidates,$strict_count,$degenerate_count,$rejected_count,$rate,$eta);
-          }
-        }
-      } else {
-        $validatedPrimer->setTag("is_degenerate", 0);
-        $validatedPrimer->setTag("iupac_coverage", "100.0");
-        $validatedPrimer->setTag("compatible_sequence_ids", $compatible_seq_ids);
-        $strict_count++;
-        # Mise à jour barre / Update progress bar
-        $_pb_done++;
-        if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
-        elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          # Ligne de progression structuree pour Flask / Structured progress line for Flask
-          if ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-            my $pct = int($_pb_done/$nb_fwd_candidates*100);
-            my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                      ? int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001)))
-                      : 0;
-            my $rate = $_pb_done / (time()-$_pb_t0+0.001);
-            printf("[LAVA-PROGRESS] %s|%d|%d|OK:%d DEG:%d REJ:%d|%.0f it/s|%d\n",
-                   $progress_label,$_pb_done,$nb_fwd_candidates,$strict_count,$degenerate_count,$rejected_count,$rate,$eta);
-          }
-        }
-      }
-      
-      push @validatedPrimers, $validatedPrimer;
-    } else {
-      $rejected_count++;
-      print "REJECTED PRIMER - Pos: $location, Couv: " . 
-            sprintf("%.1f", $coverage_percent) . "% < ${min_primer_acceptance}%\n";
-      # Mise à jour barre / Update progress bar
-      $_pb_done++;
-      if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
-      elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-        # Ligne de progression structuree pour Flask / Structured progress line for Flask
-        if ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          my $pct = int($_pb_done/$nb_fwd_candidates*100);
-          my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                    ? int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001)))
-                    : 0;
-          my $rate = $_pb_done / (time()-$_pb_t0+0.001);
-          printf("[LAVA-PROGRESS] %s|%d|%d|OK:%d DEG:%d REJ:%d|%.0f it/s|%d\n",
-                 $progress_label,$_pb_done,$nb_fwd_candidates,$strict_count,$degenerate_count,$rejected_count,$rate,$eta);
-        }
-      }
-    }
-  }
-  
-  # Finaliser la barre / Finalize progress bar
-  if ($_has_pb && $_pb_obj) { $_pb_obj->update($nb_fwd_candidates); }
-  elsif ($_LAVA_IS_TTY) {
-    # Effacer la barre et passer a la ligne suivante / Clear bar and move to next line
-    printf(STDERR "\r%-80s\n", "");
-  }
-  print "RÉSULTATS tolérance mismatches:\n";
-  print "  - Amorces strictes acceptées / accepted: $strict_count\n";
-  print "  - Amorces dégénérées acceptées / accepted: $degenerate_count\n";
-  print "  - Amorces rejetées: $rejected_count\n";
-  print "  - Total validé / Total validated: " . scalar(@validatedPrimers) . "/" . scalar(@candidatePrimers) . "\n\n";
-  
-  return @validatedPrimers;
-}
 
 
 { # Fake main() to enforce scope
@@ -867,6 +711,8 @@ sub getOligosWithMismatchTolerance {
   my $innerToMiddlePenaltyWeight = 0.5;
   my $middleToOuterPenaltyWeight = 0.5;
   my $innerForwardToReversePenaltyWeight = 0.5;
+
+  set_pipeline_threads($options_r->{"threads"});
 
   # Let the games begin...
 
