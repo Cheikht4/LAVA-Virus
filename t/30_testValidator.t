@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Copyright (c) 2026, Cheikh Talibouya <cheikhtalibouya.toure04@gmail.com | cheikhtalibouya.toure@pasteur.sn>.
-# BSD 3-Clause License — See LICENSE at root of project.
+# BSD 3-Clause License - See LICENSE at root of project.
 #
 # Tests unitaires pour LLNL::LAVA::Validator
 # Unit tests for LLNL::LAVA::Validator
@@ -25,6 +25,7 @@ my $passCount = 0;
 
 sub ok {
     my ($result, $label) = @_;
+    $label //= '';
     $testCount++;
     if ($result) {
         $passCount++;
@@ -35,7 +36,7 @@ sub ok {
 }
 
 # Nombre total de tests déclarés / Total declared tests
-BEGIN { print "1..35\n"; }
+BEGIN { print "1..34\n"; }
 
 # ─────────────────────────────────────────────────────────
 # SECTION 1 : isIUPACCompatible

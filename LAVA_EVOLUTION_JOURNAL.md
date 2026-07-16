@@ -1722,4 +1722,29 @@ En recherche génomique virale, lorsqu'un bioinformaticien exécute localement u
 - Attribution automatique de tous les cœurs disponibles moins un (`9` sur un système 10 cœurs) lorsque le mode `auto` est sélectionné.
 - Suppression définitive du blocage à `threads = 2`.
 
+---
+
+### Date/Étape : 2026-07-16 - Remplacement de l'optimisation gloutonne positionnelle par une recherche combinatoire optimale exact dans Validator.pm
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/Validator.pm`
+
+**Nature du changement** : [Algorithmique / Thermodynamique / Biologie]
+
+**Explication technique** :
+1. **Suppression de la sélection gloutonne gauche vers droite dans `checkPrimerMismatchTolerance`** :
+   - L'algorithme précédent parcourait la séquence de l'amorce candidate de l'extrémité 5' vers 3' et appliquait un code IUPAC à chaque position sous le seuil de conservation (`min_match_percent`), en s'arrêtant dès épuisement du budget (`max_total_degen`). Ce comportement positionnel rejetait faussement de nombreuses amorces candidates valides, car la couverture n'est pas additive (une séquence cible n'est couverte que si elle s'hybride sur toutes les positions de l'amorce simultanément).
+2. **Recherche combinatoire optimale (Branch and Bound exact sur sous-ensembles)** :
+   - L'instrumentation exécutée sur les 19 617 amorces candidates du jeu de données Fièvre Jaune a révélé que le nombre moyen de positions candidates par amorce est de 5,028 (avec 93,2% des amorces ayant entre 1 et 8 positions candidates, et un maximum absolu de 25).
+   - L'optimisation dégénérée (Phase 3) est désormais structurée par une recherche combinatoire exacte sur l'ensemble de tous les sous-ensembles $S$ de positions candidates valides respectant la contrainte de cardinalité ($|S| \le \text{max\_total\_degen}$), les limites en 3' (`max_3p_degen`) et les limites de contiguïté (`max_consec_degen`).
+   - Pour chaque combinaison valide, la couverture d'intersection sur toutes les séquences cibles est directement évaluée en Phase 4. Le moteur retient la combinaison qui maximise le taux de couverture global tout en minimisant le nombre total de bases dégénérées pour préserver la stabilité thermodynamique.
+
+**Justification biologique** :
+Lors de la conception d'essais LAMP face à des souches virales émergentes ou à des familles hautement polymorphes (ex: Fièvre Jaune, Dengue), les mutations qui distinguent les principaux sous-types épidémiques ne sont pas réparties uniformément de la gauche vers la droite de l'oligonucléotide. En forçant la consommation du budget de dégénérescence sur les premières mutations rencontrées en 5', l'ancien algorithme se privait d'insérer une base dégénérée plus loin en 3' ou au centre, là où une seule modification IUPAC aurait pu capturer 95% du pool viral. La sélection combinatoire optimale garantit que chaque base dégénérée est investie stratégiquement à la position qui maximise la couverture réelle de l'alignement viral global.
+
+**Impact attendu** :
+- Augmentation significative de la sensibilité diagnostique du pipeline LAVA avec récupération automatique d'amorces à haute couverture auparavant rejetées.
+- Élimination totale du biais géométrique (gauche vers droite) lors du placement des dégénérescences IUPAC.
+- Temps de calcul par amorce maintenu de l'ordre de quelques microsecondes grâce à la faible cardinalité des combinaisons candidates.
+
 

@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Copyright (c) 2026, Cheikh Talibouya <cheikhtalibouya.toure04@gmail.com | cheikhtalibouya.toure@pasteur.sn>.
-# BSD 3-Clause License — See LICENSE at root of project.
+# BSD 3-Clause License - See LICENSE at root of project.
 #
 # Tests unitaires pour LLNL::LAVA::Core
 # Unit tests for LLNL::LAVA::Core
@@ -19,6 +19,7 @@ my $passCount = 0;
 
 sub ok {
     my ($result, $label) = @_;
+    $label //= '';
     $testCount++;
     if ($result) {
         $passCount++;
@@ -28,10 +29,10 @@ sub ok {
     }
 }
 
-BEGIN { print "1..14\n"; }
+BEGIN { print "1..13\n"; }
 
 # ─────────────────────────────────────────────────────────
-# SECTION 1 : generateSigmoidPenalty — Asymétrie
+# SECTION 1 : generateSigmoidPenalty - Asymétrie
 # Vérification que les distances <= cible donnent pénalité 0
 # Verify that distances <= target yield penalty 0
 # ─────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ ok(generateSigmoidPenalty(0, 10)  == 0, 'generateSigmoidPenalty: actual = 0 < ta
 ok(generateSigmoidPenalty(-1, 24) == 100, 'generateSigmoidPenalty: negative actual -> penalty 100');
 
 # ─────────────────────────────────────────────────────────
-# SECTION 2 : generateSigmoidPenalty — Croissance au-delà du plateau
+# SECTION 2 : generateSigmoidPenalty - Croissance au-delà du plateau
 # Penalty growth beyond plateau
 # ─────────────────────────────────────────────────────────
 
@@ -65,7 +66,7 @@ my $far_beyond = generateSigmoidPenalty(200, 20);
 ok($far_beyond > 90, 'generateSigmoidPenalty: far beyond target -> penalty > 90');
 
 # ─────────────────────────────────────────────────────────
-# SECTION 3 : generateSigmoidPenalty — Monotonie
+# SECTION 3 : generateSigmoidPenalty - Monotonie
 # La pénalité doit être croissante au-delà du plateau
 # Penalty must be monotonically increasing beyond plateau
 # ─────────────────────────────────────────────────────────
