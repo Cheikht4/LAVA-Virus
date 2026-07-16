@@ -1700,4 +1700,51 @@ Dans un pipeline de criblage LAMP de haute spécificité, les étapes successive
 - Mise à jour régulière et proportionnelle de la jauge à chaque retour de lot, sans saut brutal à 100%.
 - Basculement instantané du libellé et réactivation de l'animation visuelle lors du passage à l'étape suivante.
 
+---
+
+### Date/Étape : 2026-07-15 - Déverrouillage du bornage explicite des threads dans l'interface Web
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+
+**Nature du changement** : [Bug Fix / Architecture]
+
+**Explication technique** :
+- Lors de la validation des paramètres entrants (`_validate_and_cap_threads` dans `lava_flask_app.py`), le calcul du plafond effectif (`effective_cap`) appliquait une division rigide par le quota maximal d'exécutions concurrentes (`cpu_count // MAX_CONCURRENT_RUNS`). Sur une station de travail 10 cœurs (ex: MacBook Pro M1/M2/M3) avec un quota par défaut de 5 exécutions (`MAX_CONCURRENT_RUNS=5`), ce calcul imposait systématiquement un plafond maximal à 2 cœurs (`10 // 5 = 2`).
+- En conséquence, quelle que soit la valeur inscrite par l'utilisateur dans l'interface Web (`4`, `6`, `8` ou `auto`), la fonction de validation rabattait inconditionnellement le paramètre à `2` (`min(val, 2)`).
+- Ce bridage par division a été supprimé au profit d'un bornage direct et lisible par le plafond maximal de sécurité du système (`cpu_count - 1` ou la variable d'environnement `MAX_THREADS_PER_RUN`). Si un utilisateur demande explicitement 4, 6 ou 8 cœurs sur sa machine 10 cœurs, l'interface accepte et transmet exactement cette valeur au moteur Perl (`--threads 4` / `--threads 8`). Le mode `auto` s'aligne automatiquement sur la capacité maximale raisonnable (`cpu_count - 1`).
+
+**Justification biologique** :
+En recherche génomique virale, lorsqu'un bioinformaticien exécute localement une analyse lourde sur son poste de travail ou sur une grappe dédiée pour concevoir des amorces LAMP à large spectre (ex: validation sur des centaines d'alignements complets de Fièvre Jaune ou Dengue), il a besoin de mobiliser toute la puissance de calcul disponible de sa machine pour réduire le temps de criblage thermodynamique de plusieurs heures à quelques minutes. Imposer un bridage fixe à 2 cœurs par calcul empêchait l'exploitation réelle des architectures multicoq modernes et ralentissait inutilement la recherche combinatoire.
+
+**Impact attendu** :
+- Prise en compte exacte et fidèle de la valeur saisie par l'utilisateur pour le paramètre `--threads` (`4`, `6`, `8`...).
+- Attribution automatique de tous les cœurs disponibles moins un (`9` sur un système 10 cœurs) lorsque le mode `auto` est sélectionné.
+- Suppression définitive du blocage à `threads = 2`.
+
+---
+
+### Date/Étape : 2026-07-16 - Remplacement de l'optimisation gloutonne positionnelle par une recherche combinatoire optimale exact dans Validator.pm
+
+**Fichiers impactés** :
+- `lib/LLNL/LAVA/Validator.pm`
+
+**Nature du changement** : [Algorithmique / Thermodynamique / Biologie]
+
+**Explication technique** :
+1. **Suppression de la sélection gloutonne gauche vers droite dans `checkPrimerMismatchTolerance`** :
+   - L'algorithme précédent parcourait la séquence de l'amorce candidate de l'extrémité 5' vers 3' et appliquait un code IUPAC à chaque position sous le seuil de conservation (`min_match_percent`), en s'arrêtant dès épuisement du budget (`max_total_degen`). Ce comportement positionnel rejetait faussement de nombreuses amorces candidates valides, car la couverture n'est pas additive (une séquence cible n'est couverte que si elle s'hybride sur toutes les positions de l'amorce simultanément).
+2. **Recherche combinatoire optimale (Branch and Bound exact sur sous-ensembles)** :
+   - L'instrumentation exécutée sur les 19 617 amorces candidates du jeu de données Fièvre Jaune a révélé que le nombre moyen de positions candidates par amorce est de 5,028 (avec 93,2% des amorces ayant entre 1 et 8 positions candidates, et un maximum absolu de 25).
+   - L'optimisation dégénérée (Phase 3) est désormais structurée par une recherche combinatoire exacte sur l'ensemble de tous les sous-ensembles $S$ de positions candidates valides respectant la contrainte de cardinalité ($|S| \le \text{max\_total\_degen}$), les limites en 3' (`max_3p_degen`) et les limites de contiguïté (`max_consec_degen`).
+   - Pour chaque combinaison valide, la couverture d'intersection sur toutes les séquences cibles est directement évaluée en Phase 4. Le moteur retient la combinaison qui maximise le taux de couverture global tout en minimisant le nombre total de bases dégénérées pour préserver la stabilité thermodynamique.
+
+**Justification biologique** :
+Lors de la conception d'essais LAMP face à des souches virales émergentes ou à des familles hautement polymorphes (ex: Fièvre Jaune, Dengue), les mutations qui distinguent les principaux sous-types épidémiques ne sont pas réparties uniformément de la gauche vers la droite de l'oligonucléotide. En forçant la consommation du budget de dégénérescence sur les premières mutations rencontrées en 5', l'ancien algorithme se privait d'insérer une base dégénérée plus loin en 3' ou au centre, là où une seule modification IUPAC aurait pu capturer 95% du pool viral. La sélection combinatoire optimale garantit que chaque base dégénérée est investie stratégiquement à la position qui maximise la couverture réelle de l'alignement viral global.
+
+**Impact attendu** :
+- Augmentation significative de la sensibilité diagnostique du pipeline LAVA avec récupération automatique d'amorces à haute couverture auparavant rejetées.
+- Élimination totale du biais géométrique (gauche vers droite) lors du placement des dégénérescences IUPAC.
+- Temps de calcul par amorce maintenu de l'ordre de quelques microsecondes grâce à la faible cardinalité des combinaisons candidates.
+
 

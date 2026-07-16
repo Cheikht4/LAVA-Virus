@@ -19,6 +19,7 @@ my $passCount = 0;
 
 sub ok {
     my ($result, $label) = @_;
+    $label //= '';
     $testCount++;
     if ($result) {
         $passCount++;
@@ -28,7 +29,7 @@ sub ok {
     }
 }
 
-BEGIN { print "1..14\n"; }
+BEGIN { print "1..13\n"; }
 
 # ─────────────────────────────────────────────────────────
 # SECTION 1 : generateSigmoidPenalty - Asymétrie

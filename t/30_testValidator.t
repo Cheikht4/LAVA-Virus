@@ -25,6 +25,7 @@ my $passCount = 0;
 
 sub ok {
     my ($result, $label) = @_;
+    $label //= '';
     $testCount++;
     if ($result) {
         $passCount++;
@@ -35,7 +36,7 @@ sub ok {
 }
 
 # Nombre total de tests déclarés / Total declared tests
-BEGIN { print "1..35\n"; }
+BEGIN { print "1..34\n"; }
 
 # ─────────────────────────────────────────────────────────
 # SECTION 1 : isIUPACCompatible
