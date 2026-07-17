@@ -1788,7 +1788,34 @@ En présence de gènes viraux fortement mutés (ex: gènes d'enveloppe de la Den
 La formation de dégénérescences (codes IUPAC comme R, Y, W) sur plus de 2 à 3 nucléotides adjacents (ex: `NNN` ou `RRR`) fragilise fortement la stabilité de l'hybridation thermostable requise par la polymérase à 65°C lors d'une réaction LAMP. Ces bulles d'instabilité favorisent les amorces dimères ou des hybridations aspécifiques. Garantir que la limite `max_consec_degen` (généralement configurée à 2 ou 3) est strictement respectée sur l'amorce finale, quel que soit l'ordre dans lequel l'algorithme a découvert et combiné les variants viraux les plus impactants, assure que les amorces conservent une cinétique d'hybridation fiable et spécifique.
 
 **Impact attendu** :
-- Respect rigoureux et garanti du paramètre `max_consec_degen` (ou `--max_consec_degen`) sur toutes les combinaisons d'amorces générées.
 - Élimination définitive des faux positifs où des séries de bases dégénérées consécutives s'infiltraient à cause de l'ordre de tri par gain.
+
+---
+
+### Date/Étape : 2026-07-17 - Clarification des libellés de dégénérescence et regroupement visuel dans l'interface Flask
+
+**Fichiers impactés** :
+- `lava_flask_app.py`
+- `templates/index.html`
+
+**Nature du changement** : [Architecture / Interface]
+
+**Explication technique** :
+- **Strict maintien des identifiants internes** : Les noms internes des paramètres (`primer_min_match_percent`, `primer_iupac_min_percent`, `min_primer_coverage`) ne sont absolument pas modifiés dans les formulaires HTML ni dans le code Python, garantissant l'entière rétrocompatibilité des fichiers `.params.txt` historiques et des commandes Perl exécutées par le backend.
+- **Clarification sémantique des libellés FR/EN dans `TRANSLATIONS`** :
+  - `primer_min_match_percent` (clé `match_minimum`) : renommé "Seuil de dégénérescence par position (%)" en français et "Per-position degeneracy threshold (%)" en anglais. Sa description indique explicitement que c'est le seuil en dessous duquel une position devient candidate à la dégénérescence.
+  - `primer_iupac_min_percent` (clé `match_after_iupac`) : renommé "Couverture minimale du code IUPAC (%)" en français et "Minimum IUPAC code coverage (%)" en anglais. Sa description clarifie qu'une position candidate n'est dégénérée que si le code IUPAC atteint ce seuil de couverture.
+  - `min_primer_coverage` (clé `primer_elimination`) : renommé "Couverture minimale de l'amorce (%)" en français et "Minimum primer coverage (%)" en anglais, corrigeant l'ancien libellé ("% Élimination primer") qui inversait le modèle mental de l'utilisateur.
+- **Regroupement visuel dans le template `index.html`** : Séparation des paramètres généraux de couverture en deux blocs distincts précédés d'intertitres (`per_position_header` et `per_primer_header`) et de séparateurs visuels (`<hr>`) :
+  - Bloc "Par position" / "Per position" regroupant les seuils agissant position par position lors de la construction (`primer_min_match_percent`, `primer_iupac_min_percent`, et `min_base_frequency`).
+  - Bloc "Par amorce" / "Per primer" isolant le seuil agissant sur la sélection et l'élimination finale de l'amorce complète (`min_primer_coverage`).
+
+**Justification biologique** :
+La distinction entre les mécanismes intervenant au niveau de la base individuelle (où l'algorithme décide d'introduire une mutation ponctuelle de type IUPAC si la conservation chute en dessous d'un seuil donné) et les mécanismes intervenant au niveau de l'oligonucléotide complet (où l'amorce candidate finie est validée ou rejetée selon qu'elle s'hybride à un pourcentage suffisant des souches virales) est fondamentale lors du design d'amorces pour des virus à forte diversité génétique. Ce regroupement évite toute confusion entre la construction positionnelle de l'amorce et le filtre global de couverture.
+
+**Impact attendu** :
+- Compréhension instantanée et intuitive du rôle de chaque paramètre de couverture dans l'interface graphique.
+- Élimination de toute ambiguïté sur le modèle mental des seuils (minimum à atteindre vs seuil d'élimination).
+- Rétrocompatibilité totale avec l'ensemble des exécutions, scripts et fichiers de paramètres passés.
 
 
