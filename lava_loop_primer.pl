@@ -393,12 +393,12 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "    [--primer_min_match_percent <percent, default=" .
         $optionDefaults{"primer_min_match_percent"} .
 	">]\n" .
-      "    [--primer_iupac_min_percent <percent, default=" .
-        $optionDefaults{"primer_iupac_min_percent"} .
-	">]\n" .
-      "    [--min_primer_coverage <percent, default=" .
-        $optionDefaults{"min_primer_coverage"} .
-	">]\n" .
+      "    [--primer_min_iupac_percent <percent, default=" .
+        $optionDefaults{"primer_min_iupac_percent"} .
+	"> (alias: --primer_iupac_min_percent)]\n" .
+      "    [--primer_min_coverage_percent <percent, default=" .
+        $optionDefaults{"primer_min_coverage_percent"} .
+	"> (alias: --min_primer_coverage)]\n" .
       # -----------------------------------------
       "    [--primer3_executable <path_to_primer3, default=" .
         $optionDefaults{"primer3_executable"} .
