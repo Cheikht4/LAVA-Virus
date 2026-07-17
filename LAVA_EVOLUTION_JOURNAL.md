@@ -1834,14 +1834,14 @@ La distinction entre les mécanismes intervenant au niveau de la base individuel
   - `primer_min_match_percent` (invariable)
   - `primer_min_iupac_percent` (harmonisé pour `primer_iupac_min_percent`)
   - `primer_min_coverage_percent` (harmonisé pour `min_primer_coverage`)
-- **Système d'alias bidirectionnel dans Getopt::Long (`*.pl`)** : Déclaration des alias (`"primer_min_iupac_percent|primer_iupac_min_percent=f"` et `"primer_min_coverage_percent|min_primer_coverage=f"`) combinée à une synchronisation croisée (`//=`) dès la récupération des options, garantissant que le moteur Perl traite de manière identique les deux syntaxes sur la ligne de commande ou via un fichier XML.
+- **Système d'alias bidirectionnel dans Getopt::Long et affichage de l'aide (`*.pl`)** : Déclaration des alias (`"primer_min_iupac_percent|primer_iupac_min_percent=f"` et `"primer_min_coverage_percent|min_primer_coverage=f"`) combinée à une synchronisation croisée (`//=`) dès la récupération des options. Bascule de l'affichage dans le manuel (`--help` via `printUsage`) vers les noms canoniques harmonisés avec mention explicite des alias historiques entre parenthèses.
 - **Normalisation dans le backend Flask (`lava_flask_app.py`)** : Intégration des alias dans `param_mapping` de `upload_params_file` et de `build_perl_command`, permettant aux utilisateurs d'importer des fichiers `.params.txt` avec les anciens ou les nouveaux identifiants sans aucune erreur ni perte d'information.
 
 **Justification biologique** :
 Dans les chaînes de traitement bioinformatiques à haut débit de type LAVA, la cohérence terminologique et la lisibilité des scripts en ligne de commande réduisent considérablement le risque d'erreur humaine (ex: inversion de paramètres ou oubli de seuils critiques lors d'exécutions par lots sur des clusters HPC pour surveiller des émergences virales). La standardisation de tous les seuils de couverture d'amorces sous la syntaxe `primer_min_*_percent` apporte une clarté immédiate tout en préservant l'exécutabilité des anciens pipelines et historiques de validation.
 
 **Impact attendu** :
-- Convention de nommage cohérente, prédictible et élégante dans tout le code source et les interfaces de ligne de commande.
+- Convention de nommage cohérente, prédictible et élégante dans tout le code source et dans l'aide `--help` des scripts en ligne de commande.
 - Tolérance zéro pour les régressions : 100 % de rétrocompatibilité assurée avec tous les fichiers de paramètres historiques et les anciens scripts d'automatisation.
 
 
