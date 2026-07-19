@@ -235,7 +235,8 @@ sub checkPrimerMismatchTolerance {
   # Fonction helper d'évaluation d'un candidat sur les cibles (Phase 4 intégrée)
   # Helper function to evaluate a candidate primer against targets (Integrated Phase 4)
   my $evaluate_candidate = sub {
-    my ($test_primer_seq) = @_;
+    my ($test_primer_seq, $tolerance) = @_;
+    $tolerance = 0 unless defined $tolerance;  # defaut = correspondance EXACTE (0 mismatch)
     my @compatible_seqs = ();
     
     for my $target (@target_regions) {
@@ -255,7 +256,7 @@ sub checkPrimerMismatchTolerance {
           } else {
             # Mismatch hors zone 3' : Toléré jusqu'à max_tolerated_mismatch / Mismatch outside 3' zone: Tolerated up to max_tolerated_mismatch
             $mismatch_count++;
-            if ($mismatch_count > $max_tolerated_mismatch) {
+            if ($mismatch_count > $tolerance) {
               $is_fully_compatible = 0;
               last;
             }
@@ -328,22 +329,37 @@ sub checkPrimerMismatchTolerance {
                       push @candidate_positions, {
                           pos   => $pos_offset,
                           code  => $iupac_code,
-                          is_3p => $is_3p
+                          is_3p => $is_3p,
+                          gain  => ($iupac_percent - $primer_base_percent)
                       };
                   }
               }
           }
       }
 
-      # 2. Énumération combinatoire des sous-ensembles par profondeur / Combinatorial subset enumeration
+      # 2. Énumération combinatoire des sous-ensembles avec protection anti-explosion (Étape 1)
+      # 2. Combinatorial subset enumeration with anti-explosion protection (Step 1)
       my $n_cand = scalar(@candidate_positions);
       if ($n_cand > 0) {
+          # ÉTAPE 1 : Tri par gain de couverture décroissant et plafonnement aux Top-12 positions les plus impactantes
+          # STEP 1: Sort by decreasing coverage gain and cap to Top-12 most impactful candidate positions
+          @candidate_positions = sort { $b->{gain} <=> $a->{gain} || $a->{is_3p} <=> $b->{is_3p} } @candidate_positions;
+          if ($n_cand > 12) {
+              splice(@candidate_positions, 12);
+              $n_cand = 12;
+          }
+
+          my $eval_count = 0;
+          my $max_evaluations = 2000;
           my $recurse;
           $recurse = sub {
               my ($idx, $current_combo_ref, $count_3p) = @_;
               
+              return if $eval_count >= $max_evaluations;
+              
               # Évaluer si le sous-ensemble courant contient au moins une modification
               if (@$current_combo_ref > 0) {
+                  $eval_count++;
                   my $test_primer = $candidate_primer_uc;
                   for my $item (@$current_combo_ref) {
                       substr($test_primer, $item->{pos}, 1) = $item->{code};
@@ -373,26 +389,30 @@ sub checkPrimerMismatchTolerance {
               return if scalar(@$current_combo_ref) >= $max_total_degen;
               
               for my $i ($idx .. $n_cand - 1) {
+                  return if $eval_count >= $max_evaluations;
                   my $item = $candidate_positions[$i];
                   my $new_count_3p = $count_3p + $item->{is_3p};
                   
                   # Vérification limite 3' / Check 3' limit
                   next if $new_count_3p > $max_3p_degen;
                   
-                  # Vérification limite positions consécutives / Check consecutive limit
+                  # Vérification limite positions consécutives (indépendante de l'ordre de tri) / Check consecutive limit (order-independent)
                   if (@$current_combo_ref > 0) {
-                      my $last_pos = $current_combo_ref->[-1]->{pos};
-                      if ($item->{pos} == $last_pos + 1) {
-                          my $consec_len = 2;
-                          for (my $j = scalar(@$current_combo_ref) - 2; $j >= 0; $j--) {
-                              if ($current_combo_ref->[$j]->{pos} == $current_combo_ref->[$j+1]->{pos} - 1) {
-                                  $consec_len++;
-                              } else {
-                                  last;
-                              }
+                      my @all_pos = map { $_->{pos} } @$current_combo_ref;
+                      push @all_pos, $item->{pos};
+                      @all_pos = sort { $a <=> $b } @all_pos;
+                      
+                      my $max_consec = 1;
+                      my $curr_consec = 1;
+                      for (my $j = 1; $j < scalar(@all_pos); $j++) {
+                          if ($all_pos[$j] == $all_pos[$j-1] + 1) {
+                              $curr_consec++;
+                              $max_consec = $curr_consec if $curr_consec > $max_consec;
+                          } else {
+                              $curr_consec = 1;
                           }
-                          next if $consec_len > $max_consec_degen;
                       }
+                      next if $max_consec > $max_consec_degen;
                   }
                   
                   push @$current_combo_ref, $item;
@@ -408,14 +428,17 @@ sub checkPrimerMismatchTolerance {
 
   $optimized_primer = $best_primer;
   $has_modifications = ($best_mod_count > 0) ? 1 : 0;
-  my @final_compatible_sequences = @$best_compatible_seqs;
-  my $final_coverage_percent = $best_coverage_percent;
+
+  # Validation finale : la tolerance aux mismatchs n'intervient qu'ICI, contre min_primer_coverage.
+  # Final validation: mismatch tolerance applies ONLY here, against min_primer_coverage.
+  my $tolerant_seqs_r = $evaluate_candidate->($optimized_primer, $max_tolerated_mismatch);
+  my $final_coverage_percent = (scalar(@$tolerant_seqs_r) / $total_regions) * 100;
 
   if ($final_coverage_percent < $min_primer_coverage) {
     return ("", $final_coverage_percent, 0, []);
   }
-  
-  return ($optimized_primer, $final_coverage_percent, $has_modifications, \@final_compatible_sequences);
+
+  return ($optimized_primer, $final_coverage_percent, $has_modifications, $tolerant_seqs_r);
 }
 
 
