@@ -349,7 +349,7 @@
                                     value="{{ params.stem_primer_max_length }}" min="18" max="35">
                             </div>
                         </div>
-                        <div class="row">
+                        <div class="row mb-3">
                             <div class="col-md-4">
                                 <label class="form-label">{{ 'stem_target_tm'|t }}</label>
                                 <input type="number" step="0.5" class="form-control" name="stem_primer_target_tm"
@@ -364,6 +364,15 @@
                                 <label class="form-label">{{ 'stem_max_tm'|t }}</label>
                                 <input type="number" step="0.5" class="form-control" name="stem_primer_max_tm"
                                     value="{{ params.stem_primer_max_tm }}" min="50" max="70">
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-12">
+                                <label class="form-label">{{ 'stem_orientation'|t }}</label>
+                                <select class="form-select" name="stem_orientation">
+                                    <option value="0" {{ 'selected' if params.stem_orientation == 0 }}>{{ 'stem_orientation_conventional'|t }}</option>
+                                    <option value="1" {{ 'selected' if params.stem_orientation == 1 }}>{{ 'stem_orientation_opposite'|t }}</option>
+                                </select>
                             </div>
                         </div>
                     </div>

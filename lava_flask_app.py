@@ -100,6 +100,9 @@ TRANSLATIONS = {
         'max_dist_middle_inner': 'Dist. Max Middle-Inner',
         'penalty_plateau': 'Plateau de Pénalité (0.1-0.5)',
         'penalty_slope': 'Pente Sigmoïde (0.05-0.5)',
+        'stem_orientation': 'Orientation STEM',
+        'stem_orientation_conventional': '0 (Conventionnel - Original)',
+        'stem_orientation_opposite': '1 (Opposé)',
         # Clés manquantes / Missing keys
         'resolve_overlap_label': 'Priorité de Dédoublonnage (Chevauchement)',
         'resolve_overlap_penalty': 'Pénalité Biochimique et Géométrique (Défaut/Sûr)',
@@ -253,6 +256,12 @@ TRANSLATIONS = {
         'target_tm': 'Target Tm (°C)',
         'min_tm': 'Min Tm (°C)',
         'max_tm': 'Max Tm (°C)',
+        'stem_target_tm': 'Target Tm',
+        'stem_min_tm': 'Min Tm',
+        'stem_max_tm': 'Max Tm',
+        'stem_orientation': 'STEM Orientation',
+        'stem_orientation_conventional': '0 (Conventional)',
+        'stem_orientation_opposite': '1 (Opposite)',
         'loop_advanced_params': 'Advanced LOOP parameters',
         'loop_target_length': 'LOOP target length',
         'loop_min_length': 'LOOP min length',
@@ -636,6 +645,7 @@ def get_default_params():
         'max_poly_bases': 2,
         'min_signatures_for_success': 1,
         'max_overlap_percent': 0,
+        'stem_orientation': 0,
         'threads': 'auto',
         # Reduction spatiale par fenetre / Spatial window reduction
         'window_size': 0,        # 0 = desactive, ex: 5 = fenetre de 5nt
@@ -1127,7 +1137,7 @@ def execute_lava_background(execution_id, script_type, input_file, output_name, 
         stem_only_params = {
             'include_stem_primers', 'min_primer_spacing', 'min_inner_pair_spacing',
             'stem_primer_target_length', 'stem_primer_min_length', 'stem_primer_max_length',
-            'stem_primer_target_tm', 'stem_primer_min_tm', 'stem_primer_max_tm',
+            'stem_primer_target_tm', 'stem_primer_min_tm', 'stem_primer_max_tm', 'stem_orientation',
         }
         
         # Sélectionner les paramètres valides selon le script
