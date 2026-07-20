@@ -182,6 +182,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "inner_pair_target_length=i" => \$options{"inner_pair_target_length"},
 
       "include_stem_primers=i" => \$options{"include_stem_primers"},
+      "stem_orientation=i" => \$options{"stem_orientation"},  # 0=conventionnel (defaut), 1=oppose
       "min_signatures_for_success=i" => \$options{"min_signatures_for_success"},
       "min_primer_spacing=i" => \$options{"min_primer_spacing"},
       "min_inner_pair_spacing=i" => \$options{"min_inner_pair_spacing"},
@@ -248,6 +249,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "inner_primer_target_tm" => "62.0",
       "max_poly_bases" => 2,
       "include_stem_primers" => 1,
+      "stem_orientation" => 0,
       "min_signatures_for_success" => 1, # Should probably never go lower / Ne devrait probablement jamais descendre plus bas
       "min_primer_spacing" => 1,
       "min_inner_pair_spacing" => 1,
@@ -605,6 +607,9 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   my $includeStemPrimers = 
     optionWithDefault($options_r, "include_stem_primers", 
       $optionDefaults{"include_stem_primers"});
+  my $stemOrientation =
+    optionWithDefault($options_r, "stem_orientation",
+      $optionDefaults{"stem_orientation"});
 
   my $maxDeltaTm = 
     optionWithDefault($options_r, "max_tm_diff", 5.0);
@@ -868,27 +873,35 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   my @stemForwardPrimers = ();
   
   if($includeStemPrimers == $TRUE) {
-    # BSTEM : genere nativement sur le brin + (Back Stem = sens du brin +)
-    # BSTEM: natively generated on plus strand (Back Stem = sense of plus strand)
-    print "Enumerating STEM BACK (BSTEM) primers on plus strand\n";
-    @stemBackPrimers = getOligosWithMismatchTolerance($stemEnumerator, $inputMSA,
+    # Interrupteur global d'orientation (Gandelman 2011, Fig 7) : les deux stems sont TOUJOURS
+    # sur des brins opposes ; on choisit laquelle des deux configs valides on utilise.
+    #   stem_orientation == 0 (conventionnel) : FSTEM = brin minus (pres F1), BSTEM = brin plus (pres B1)
+    #   stem_orientation == 1 (oppose)        : FSTEM = brin plus  (pres F1), BSTEM = brin minus (pres B1)
+    # On genere les deux pools, puis on assigne chaque role selon l'option.
+
+    # Pool brin + (sens), genere nativement
+    my @stemPlusPool = getOligosWithMismatchTolerance($stemEnumerator, $inputMSA,
                                                         $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-                                                        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Stem Back (BSTEM)");
-
-    print "  Generated \"" .
-      scalar(@stemBackPrimers) .
-      "\" STEM BACK (BSTEM) primers\n";
-
-    # FSTEM : Option B - genere nativement sur RC(MSA) pour garantir la protection 3'
-    # FSTEM: Option B - natively generated on RC(MSA) to guarantee 3-prime protection
-    print "Enumerating STEM FORWARD (FSTEM) NATIVE reverse primers (Option B)\n";
-    @stemForwardPrimers = buildNativeReversePool(
+                                                        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Stem plus");
+    # Pool brin - (reverse), genere nativement sur RC(MSA) (protection 3')
+    my @stemMinusPool = buildNativeReversePool(
       $stemEnumerator, $inputMSA,
       $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
       $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Stem Forward (FSTEM)"
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Stem minus"
     );
-    print "  Generated \"" . scalar(@stemForwardPrimers) . "\" STEM FORWARD (FSTEM) native primers\n";
+
+    if($stemOrientation == 0) {
+      # Conventionnel : FSTEM=minus, BSTEM=plus
+      @stemForwardPrimers = @stemMinusPool;
+      @stemBackPrimers    = @stemPlusPool;
+      print "  STEM orientation=conventionnel : FSTEM=minus (" . scalar(@stemForwardPrimers) . "), BSTEM=plus (" . scalar(@stemBackPrimers) . ")\n";
+    } else {
+      # Oppose : FSTEM=plus, BSTEM=minus
+      @stemForwardPrimers = @stemPlusPool;
+      @stemBackPrimers    = @stemMinusPool;
+      print "  STEM orientation=oppose : FSTEM=plus (" . scalar(@stemForwardPrimers) . "), BSTEM=minus (" . scalar(@stemBackPrimers) . ")\n";
+    }
   } else {
     print "STEM primers désactivés - génération ignorée\n";
   }
@@ -1359,8 +1372,16 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
               $innerLength + 20;
             if($searchStartAt < 0) { $searchStartAt = 0; }
 
-            my $stemStartAt = $innerLocation + $innerLength + $minPrimerSpacing + $stemPrimerMaxLength;
-            my $stemEndAt   = $innerLocation + $innerLength + $minPrimerSpacing + (2 * $stemPrimerMaxLength);
+            my ($stemStartAt, $stemEndAt);
+            if($stemOrientation == 0) {
+              # Conventionnel : FSTEM sur brin minus (corps s'etend vers la gauche) -> degager F1 de 2*L
+              $stemStartAt = $innerLocation + $innerLength + $minPrimerSpacing + $stemPrimerMaxLength;
+              $stemEndAt   = $innerLocation + $innerLength + $minPrimerSpacing + (2 * $stemPrimerMaxLength);
+            } else {
+              # Oppose : FSTEM sur brin plus (corps s'etend vers la droite) -> location juste apres F1
+              $stemStartAt = $innerLocation + $innerLength + $minPrimerSpacing;
+              $stemEndAt   = $innerLocation + $innerLength + $minPrimerSpacing + $stemPrimerMaxLength;
+            }
             if($stemEndAt < $stemStartAt) { $stemEndAt = $stemStartAt + 50; }
             if($stemEndAt < 0) { $stemEndAt = 0; }
 
@@ -1598,8 +1619,16 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
             my $searchStartAt = $innerLocation + $innerLength +
               $minPrimerSpacing;
 
-            my $stemStartAt = $innerLocation - $minPrimerSpacing - (2 * $stemPrimerMaxLength);
-            my $stemEndAt   = $innerLocation - $minPrimerSpacing - $stemPrimerMaxLength;
+            my ($stemStartAt, $stemEndAt);
+            if($stemOrientation == 0) {
+              # Conventionnel : BSTEM sur brin plus (corps s'etend vers la droite) -> degager B1 de 2*L
+              $stemStartAt = $innerLocation - $minPrimerSpacing - (2 * $stemPrimerMaxLength);
+              $stemEndAt   = $innerLocation - $minPrimerSpacing - $stemPrimerMaxLength;
+            } else {
+              # Oppose : BSTEM sur brin minus (corps s'etend vers la gauche) -> location juste avant B1
+              $stemStartAt = $innerLocation - $minPrimerSpacing - $stemPrimerMaxLength;
+              $stemEndAt   = $innerLocation - $minPrimerSpacing;
+            }
             if($stemStartAt < 0) { $stemStartAt = 0; }
             if($stemStartAt > $stemEndAt) { $stemStartAt = ($stemEndAt > 50) ? $stemEndAt - 50 : 0; }  # fallback
 
