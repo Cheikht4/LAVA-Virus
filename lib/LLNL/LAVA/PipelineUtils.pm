@@ -438,7 +438,30 @@ sub buildNativeReversePool {
 
   # --- 3. Lancer Primer3 sur le RC de l alignement ---
   # Run Primer3 on the RC alignment (generates native minus-strand primers)
+  
+  # LAVA 2026: Si une fenetre géométrique (INCLUDED_REGION) est définie pour le brin PLUS,
+  # on doit inverser ses coordonnées pour qu'elle s'applique correctement au RC MSA
+  my $original_included_region = $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"};
+  if ($original_included_region) {
+    my ($start, $len) = split(/,/, $original_included_region);
+    # BioPerl/Primer3 utilise des coordonnées 0-based.
+    # start = index 0-based.
+    # Ex: alignment = 11039 bases. start = 4128, len = 1201.
+    # Fin de la region sur brin plus = start + len = 4128 + 1201 = 5329.
+    # Nouveau start sur RC = alignmentLength - fin = 11039 - 5329 = 5710.
+    my $rc_start = $alignmentLength - ($start + $len);
+    if ($rc_start < 0) { $rc_start = 0; }
+    
+    $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"} = "$rc_start,$len";
+    print "  [NativeReverse] RC INCLUDED_REGION ajustée : $rc_start,$len\n";
+  }
+
   my @candidatePrimers = $enumerator->getOligos($rcAlignment);
+  
+  # Restaurer l'original pour ne pas corrompre l'énumérateur
+  if ($original_included_region) {
+    $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"} = $original_included_region;
+  }
   print "  [NativeReverse] Primer3 a genere / generated " . scalar(@candidatePrimers) . " candidats sur RC MSA\n";
 
   # --- 4. Valider chaque candidat contre les sequences RC ---
