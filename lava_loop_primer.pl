@@ -1304,6 +1304,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   my $num_fwd_chunks = $pm_fwd->{max_processes} * 12;
   $num_fwd_chunks = 30 if $num_fwd_chunks < 30;
   $num_fwd_chunks = $innerForwardCount if $num_fwd_chunks > $innerForwardCount;
+  $num_fwd_chunks = 1 if $num_fwd_chunks < 1;
   my $fwd_chunk_size = int(($innerForwardCount + $num_fwd_chunks - 1) / $num_fwd_chunks);
   $fwd_chunk_size = 1 if $fwd_chunk_size < 1;
 
