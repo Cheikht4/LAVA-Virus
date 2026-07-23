@@ -593,9 +593,9 @@
 
                     <!-- Fixed Primers (Dynamic Rows) -->
                     <div class="mb-4 p-3 border rounded bg-light">
-                        <label class="form-label fw-bold text-primary"><i class="fas fa-anchor me-2"></i>{{ 'fixed_primers'|t|default('Amorces Fixées (Optionnel)') }}</label>
+                        <label class="form-label fw-bold text-primary"><i class="fas fa-anchor me-2"></i>{{ 'fixed_primers'|t }}</label>
                         <div class="form-text mb-3">
-                            Fixe and use specific primer sequence.
+                            {{ 'fixed_primers_desc'|t }}
                         </div>
                         
                         <div id="fixed_primers_list">
@@ -603,7 +603,7 @@
                         </div>
                         
                         <button type="button" class="btn btn-sm btn-outline-primary mt-2" onclick="addFixedPrimerRow()">
-                            <i class="fas fa-plus me-1"></i> Ajouter une amorce fixée
+                            <i class="fas fa-plus me-1"></i> {{ 'add_fixed_primer'|t }}
                         </button>
                     </div>
 
@@ -811,10 +811,11 @@
                 </select>
             </div>
             <div class="col-md-5">
-                <input type="text" class="form-control fp-seq" name="fp_seq[]" placeholder="Séquence (ex: ACGT...)" required>
+                <input type="text" class="form-control fp-seq" name="fp_seq[]" placeholder="{{ 'sequence_placeholder'|t }}" required>
             </div>
             <div class="col-md-3">
-                <input type="number" class="form-control fp-pos" name="fp_pos[]" placeholder="Position (opt.)" min="0">
+                <input type="number" class="form-control fp-pos" name="fp_pos[]" placeholder="{{ 'position_placeholder'|t }}" min="0">
+                <div class="form-text" style="font-size: 0.75rem;">{{ 'position_help'|t }}</div>
             </div>
             <div class="col-md-1">
                 <button type="button" class="btn btn-outline-danger btn-sm w-100" onclick="this.closest('.fixed-primer-row').remove()">
