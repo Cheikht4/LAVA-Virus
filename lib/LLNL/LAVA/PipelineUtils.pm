@@ -1964,6 +1964,26 @@ sub findPrimerPositionInAlignment {
   my $primer_uc  = uc($primer_seq);
   my $primer_rc  = uc(rev_comp($primer_seq));
 
+  # Helper pour convertir une chaine IUPAC en regex / Helper to convert IUPAC string to regex
+  my $iupac_to_regex = sub {
+    my $seq = shift;
+    $seq =~ s/R/[AG]/g;
+    $seq =~ s/Y/[CT]/g;
+    $seq =~ s/S/[CG]/g;
+    $seq =~ s/W/[AT]/g;
+    $seq =~ s/K/[GT]/g;
+    $seq =~ s/M/[AC]/g;
+    $seq =~ s/B/[CGT]/g;
+    $seq =~ s/D/[AGT]/g;
+    $seq =~ s/H/[ACT]/g;
+    $seq =~ s/V/[ACG]/g;
+    $seq =~ s/N/[ACGT]/g;
+    return qr/$seq/;
+  };
+
+  my $regex_plus  = $iupac_to_regex->($primer_uc);
+  my $regex_minus = $iupac_to_regex->($primer_rc);
+
   # Fonction interne de recherche dans une sequence alignee (avec et sans gaps)
   # Internal helper: search in an aligned sequence (with and without gaps)
   my $scan_seq = sub {
@@ -1971,12 +1991,14 @@ sub findPrimerPositionInAlignment {
     my $aln_seq_uc = uc($aln_seq_raw);
 
     # Recherche directe (brin plus) / Direct search (plus strand)
-    my $pos = index($aln_seq_uc, $primer_uc);
-    return ($pos, "plus") if $pos >= 0;
+    if ($aln_seq_uc =~ /$regex_plus/) {
+      return ($-[0], "plus");
+    }
 
     # Recherche du reverse complement (brin moins) / Reverse complement search (minus strand)
-    $pos = index($aln_seq_uc, $primer_rc);
-    return ($pos, "minus") if $pos >= 0;
+    if ($aln_seq_uc =~ /$regex_minus/) {
+      return ($-[0], "minus");
+    }
 
     return (undef, undef);
   };
@@ -1990,12 +2012,12 @@ sub findPrimerPositionInAlignment {
 
       if ($hint_position + $len <= length($aln_str)) {
         my $region = substr($aln_str, $hint_position, $len);
-        if ($region eq $primer_uc) {
+        if ($region =~ /^$regex_plus$/) {
           print "[FIXED PRIMER] Sequence trouvee a la position fournie $hint_position (brin +).\n";
           print "[FIXED PRIMER] Sequence found at supplied position $hint_position (+ strand).\n";
           return ($hint_position, "plus");
         }
-        if ($region eq $primer_rc) {
+        if ($region =~ /^$regex_minus$/) {
           print "[FIXED PRIMER] Sequence RC trouvee a la position fournie $hint_position (brin -).\n";
           print "[FIXED PRIMER] RC sequence found at supplied position $hint_position (- strand).\n";
           return ($hint_position, "minus");
