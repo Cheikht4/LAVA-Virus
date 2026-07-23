@@ -489,6 +489,11 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     printf("[FIXED PRIMER] Spec enregistree: TYPE=%s SEQ=%s POS=%s\n",
            $spec->{type}, $spec->{seq}, defined $spec->{pos} ? $spec->{pos} : "auto");
   }
+  my %isFixedType = ();
+  for my $spec (@fixedPrimerSpecs) {
+    $isFixedType{$spec->{type}} = 1;
+  }
+
 
 
   my $outerPrimerTargetLength =
@@ -893,24 +898,32 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     });
 
   print "Enumerating outer forward primers\n";
-  my @outerForwardPrimers = getOligosWithMismatchTolerance($outerEnumerator, $inputMSA, 
+  my @outerForwardPrimers = ();
+  if ($isFixedType{"F3"}) {
+    print "Skipping outer forward (F3) enumeration because it is fixed.\n";
+  } else {
+    @outerForwardPrimers = getOligosWithMismatchTolerance($outerEnumerator, $inputMSA, 
                                                           $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
                                                           $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Outer Forward (F3)");
 
-  print "  Generated \"" .
-    scalar(@outerForwardPrimers) .
-    "\" outer forward primers (avec tolérance mismatches)\n";
+    print "  Generated \"" . scalar(@outerForwardPrimers) . "\" outer forward primers\n";
+  }
 
 
   # Option B : Generation NATIVE des Reverse Outer via Primer3 sur RC(MSA)
   print "Enumerating outer NATIVE reverse primers (Option B)\n";
-  my @outerReversePrimers = buildNativeReversePool(
-    $outerEnumerator, $inputMSA,
-    $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-    \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Outer Reverse (B3)"
-  );
-  print "  Generated \"" . scalar(@outerReversePrimers) . "\" outer native reverse primers\n";
+  my @outerReversePrimers = ();
+  if ($isFixedType{"B3"}) {
+    print "Skipping outer reverse (B3) enumeration because it is fixed.\n";
+  } else {
+    @outerReversePrimers = buildNativeReversePool(
+      $outerEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Outer Reverse (B3)"
+    );
+    print "  Generated \"" . scalar(@outerReversePrimers) . "\" outer native reverse primers\n";
+  }
 
 
   # Enumerate STEM primers, since the STEM primers extend in the opposite 
@@ -955,16 +968,31 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     # On genere les deux pools, puis on assigne chaque role selon l'option.
 
     # Pool brin + (sens), genere nativement
-    my @stemPlusPool = getOligosWithMismatchTolerance($stemEnumerator, $inputMSA,
-                                                        $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-                                                        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Stem plus");
+    my @stemPlusPool = ();
+    print "Enumerating stem BACK (BSTEM) primers on plus strand\n";
+    if ($isFixedType{"BSTEM"}) {
+      print "Skipping stem BACK (BSTEM) enumeration because it is fixed.\n";
+    } else {
+      @stemPlusPool = getOligosWithMismatchTolerance($stemEnumerator, $inputMSA,
+                                                          $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+                                                          $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Stem plus");
+      print "  Generated \"" . scalar(@stemPlusPool) . "\" stem BACK (BSTEM) primers\n";
+    }
+
     # Pool brin - (reverse), genere nativement sur RC(MSA) (protection 3')
-    my @stemMinusPool = buildNativeReversePool(
-      $stemEnumerator, $inputMSA,
-      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Stem minus"
-    );
+    my @stemMinusPool = ();
+    print "Enumerating stem FORWARD (FSTEM) NATIVE reverse primers (Option B)\n";
+    if ($isFixedType{"FSTEM"}) {
+      print "Skipping stem FORWARD (FSTEM) enumeration because it is fixed.\n";
+    } else {
+      @stemMinusPool = buildNativeReversePool(
+        $stemEnumerator, $inputMSA,
+        $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+        \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Stem Forward (FSTEM)"
+      );
+      print "  Generated \"" . scalar(@stemMinusPool) . "\" stem FORWARD (FSTEM) native primers\n";
+    }
 
     if($stemOrientation == 0) {
       # Conventionnel : FSTEM=minus, BSTEM=plus
@@ -1005,23 +1033,31 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     });
 
   print "Enumerating middle forward primers\n";
-  my @middleForwardPrimers = getOligosWithMismatchTolerance($middleEnumerator, $inputMSA,
+  my @middleForwardPrimers = ();
+  if ($isFixedType{"F2"}) {
+    print "Skipping middle forward (F2) enumeration because it is fixed.\n";
+  } else {
+    @middleForwardPrimers = getOligosWithMismatchTolerance($middleEnumerator, $inputMSA,
                                                            $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
                                                            $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Middle Forward (F2)");
 
-  print "  Generated \"" .
-    scalar(@middleForwardPrimers) .
-    "\" middle primers (avec tolérance mismatches)\n";
+    print "  Generated \"" . scalar(@middleForwardPrimers) . "\" middle primers\n";
+  }
 
   # Option B : Generation NATIVE des Reverse Middle via Primer3 sur RC(MSA)
   print "Enumerating middle NATIVE reverse primers (Option B)\n";
-  my @middleReversePrimers = buildNativeReversePool(
-    $middleEnumerator, $inputMSA,
-    $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-    \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Middle Reverse (B2)"
-  );
-  print "  Generated \"" . scalar(@middleReversePrimers) . "\" middle native reverse primers\n";
+  my @middleReversePrimers = ();
+  if ($isFixedType{"B2"}) {
+    print "Skipping middle reverse (B2) enumeration because it is fixed.\n";
+  } else {
+    @middleReversePrimers = buildNativeReversePool(
+      $middleEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Middle Reverse (B2)"
+    );
+    print "  Generated \"" . scalar(@middleReversePrimers) . "\" middle native reverse primers\n";
+  }
 
   # Enumerate inner primers 
   my $innerEnumerator = LLNL::LAVA::OligoEnumerator::Primer3Conserved->new(
@@ -1047,23 +1083,31 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     });
 
   print "Enumerating inner forward primers\n";
-  my @innerForwardPrimers = getOligosWithMismatchTolerance($innerEnumerator, $inputMSA,
+  my @innerForwardPrimers = ();
+  if ($isFixedType{"F1C"}) {
+    print "Skipping inner forward (F1C) enumeration because it is fixed.\n";
+  } else {
+    @innerForwardPrimers = getOligosWithMismatchTolerance($innerEnumerator, $inputMSA,
                                                           $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
                                                           $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Inner Forward (F1c)");
 
-  print "  Generated \"" .
-    scalar(@innerForwardPrimers) .
-    "\" inner primers (avec tolérance mismatches)\n";
+    print "  Generated \"" . scalar(@innerForwardPrimers) . "\" inner primers\n";
+  }
 
   # Option B : Generation NATIVE des Reverse Inner via Primer3 sur RC(MSA)
   print "Enumerating inner NATIVE reverse primers (Option B)\n";
-  my @innerReversePrimers = buildNativeReversePool(
-    $innerEnumerator, $inputMSA,
-    $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-    \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Inner Reverse (B1c)"
-  );
-  print "  Generated \"" . scalar(@innerReversePrimers) . "\" inner native reverse primers\n";
+  my @innerReversePrimers = ();
+  if ($isFixedType{"B1C"}) {
+    print "Skipping inner reverse (B1C) enumeration because it is fixed.\n";
+  } else {
+    @innerReversePrimers = buildNativeReversePool(
+      $innerEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Inner Reverse (B1c)"
+    );
+    print "  Generated \"" . scalar(@innerReversePrimers) . "\" inner native reverse primers\n";
+  }
 
   # TODO: want to flip any primer locations to reflect the standard
   # positive strand 5' location notation if they were generated
