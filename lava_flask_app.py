@@ -1150,7 +1150,7 @@ def execute_lava_background(execution_id, script_type, input_file, output_name, 
         
         # Ajouter les paramètres
         for param_name, param_value in params.items():
-            if param_value is not None and param_name not in ['script_type', 'lamp_mode']:
+            if param_value is not None and param_name not in ['script_type', 'lamp_mode', 'fixed_primers']:
                 # Convertir les booléens en entiers pour les scripts Perl
                 if isinstance(param_value, bool):
                     param_value = 1 if param_value else 0
@@ -1165,6 +1165,14 @@ def execute_lava_background(execution_id, script_type, input_file, output_name, 
                     cmd.extend([f"--{perl_param_name}", str(param_value)])
                 else:
                     print(f"⚠️  Paramètre ignoré (non supporté par Perl): {param_name} -> {perl_param_name}")
+        
+        # Traitement special pour les amorces fixees (champ texte multi-lignes)
+        if 'fixed_primers' in params and params['fixed_primers']:
+            fixed_lines = params['fixed_primers'].strip().split('\n')
+            for line in fixed_lines:
+                line = line.strip()
+                if line:
+                    cmd.extend(["--fixed_primer", line])
         
         # Sauvegarder les paramètres dans un fichier texte pour la traçabilité
         params_file_path = f"{output_base}.params.txt"

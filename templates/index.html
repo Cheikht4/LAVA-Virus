@@ -591,6 +591,17 @@
                         <div class="form-text">{{ 'files_will_be_named'|t }}</div>
                     </div>
 
+                    <!-- Fixed Primers -->
+                    <div class="mb-3">
+                        <label for="fixed_primers" class="form-label fw-bold"><i class="fas fa-anchor me-2"></i>{{ 'fixed_primers'|t|default('Amorces Fixées (Fixed Primers)') }}</label>
+                        <textarea class="form-control font-monospace" name="fixed_primers" rows="3" placeholder="TYPE:SEQUENCE ou TYPE:SEQUENCE:POSITION (ex: F2:ACGTACGT... ou B3:GCTAGC...:450)
+Un par ligne / One per line"></textarea>
+                        <div class="form-text">
+                            Optionnel. Force LAVA à intégrer des amorces validées expérimentalement (Branche & Bound IUPAC appliqué).<br>
+                            Types valides : F3 B3 F2 B2 F1C B1C FLOOP BLOOP FSTEM BSTEM.
+                        </div>
+                    </div>
+
                     <button type="submit" class="btn btn-warning btn-lg">
                         <i class="fas fa-rocket me-2"></i>{{ 'execute_button'|t }}
                     </button>
