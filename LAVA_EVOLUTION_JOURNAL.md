@@ -1879,39 +1879,46 @@ Un outil de diagnostic se doit d'être irréprochable sur ses filtres d'inclusio
 Ajout de la fonctionnalite "Fixed Primer" (inspiree de PrimerExplorer V5), permettant de fixer
 une ou plusieurs amorces LAMP dont la sequence est deja connue et validee experimentalement.
 
-Deux nouvelles fonctions centralisees dans `PipelineUtils.pm` :
+Trois nouvelles fonctions centralisees dans `PipelineUtils.pm` :
 1. `findPrimerPositionInAlignment($alignment, $seq, $hint_pos)` : Localise une sequence d amorce
    dans le MSA. Strategie en cascade : essai a la position fournie, fallback scan complet
    (brin + et brin - via rev_comp).
-2. `injectFixedPrimers($alignment, \@specs, ...)` : Pour chaque amorce specifiee, localise
+2. `computeFixedPrimerWindows(\@specs, $sig_max, $margin, $aln_length)` : Calcule une fenetre
+   geometrique stricte `[P - sig_max - margin, P + sig_max + margin]` en prenant l'intersection
+   des contraintes de toutes les amorces fixees.
+3. `injectFixedPrimers($alignment, \@specs, ...)` : Pour chaque amorce specifiee, localise
    sa position, la passe par `checkPrimerMismatchTolerance` (Branch and Bound IUPAC) pour
    tenter d ajouter des bases degenerees et ameliorer la couverture, puis cree un objet
-   `LLNL::LAVA::Oligo` compatible avec le reste du pipeline. L amorce est TOUJOURS injectee
-   dans le pool (tag `coverage_forced=1`) meme si la couverture est sous le seuil.
+   `LLNL::LAVA::Oligo` compatible avec le pipeline.
+
+Optimisation spatiale precoce (Filtrage Geometrique) :
+Afin d'eviter l'explosion combinatoire et le temps de calcul sur de longs genomes (ex: 10kb+),
+le systeme resout desormais la position des amorces fixes des le chargement du MSA (avant Primer3).
+Ensuite, chaque pool genere par Primer3 (F3, B3, F2...) subit un filtrage `grep` strict pour
+eliminer les candidats hors de la fenetre geometrique pre-calculee. Les candidats impossibles
+sont elimines instantanement, evitant d'engorger `analyzeAll` et le Branch & Bound.
 
 Interface CLI : option `--fixed_primer` repeatable (N amorces fixables).
 Format : `TYPE:SEQUENCE` ou `TYPE:SEQUENCE:POSITION`.
 Types valides LOOP : F3 B3 F2 B2 F1C B1C FLOOP BLOOP.
 Types valides STEM : F3 B3 F2 B2 F1C B1C FSTEM BSTEM.
 
-Les amorces fixees sont injectees en debut de pool (via `unshift`) avant l appel a `analyzeAll`,
-pour etre traitees par le moteur combinatoire Branch and Bound exactement comme les amorces
-normales, tout en restant garanties dans la signature finale.
+Les amorces fixees sont injectees en debut de pool (via `unshift`) apres le filtrage geometrique,
+pour etre traitees par le moteur combinatoire Branch and Bound.
 
 **Justification biologique** :
 Dans les projets de surveillance epidemiologique en temps reel, les equipes de laboratoire
 ont souvent deja valide une ou plusieurs amorces par PCR classique ou par LAMP initial.
 La re-conception complete d un kit en abandonnant les amorces deja testees represente un
-cout et un delai inacceptable (commande oligos, re-validation wet lab, stock epuise).
-La fonctionnalite "Fixed Primer" permet de garder ces amorces validees comme point d ancrage,
-et de laisser LAVA optimiser les 5 amorces restantes autour d elles en tirant parti
-du Branch and Bound et de la tolerance aux mismatches IUPAC. Le tag `coverage_forced`
-signale explicitement a l analyste que l amorce n a pas satisfait le seuil naturellement
-mais est incluse par decision de l utilisateur (transparence totale).
+cout et un delai inacceptable. La fonctionnalite "Fixed Primer" permet de garder ces amorces
+comme point d ancrage. Le filtrage geometrique strict assure qu'une amorce fixee a 5000nt sur
+un genome de 10000nt n'entrainera aucune tentative d'hybridation a 1000nt ou 9000nt, collant
+exactement a la cinetique reelle d'une reaction LAMP (limitee spatialement a ~400nt).
 
 **Impact attendu** :
-- Capacite de reutiliser des amorces validees existantes sans reprendre le design complet.
-- Branch and Bound IUPAC applique sur l amorce fixee pour tenter d ameliorer sa couverture.
-- Logs detailles `[FIXED PRIMER]` pour la tracabilite de l injection.
+- Capacite de reutiliser des amorces validees existantes.
+- Branch and Bound IUPAC applique sur l amorce fixee.
+- Temps de calcul divise drastiquement sur les longs genomes grace a la fenetre geometrique.
+- Elimination precoce des faux candidats spatiaux.
 - Aucune regression : 7/7 tests canary passes.
 

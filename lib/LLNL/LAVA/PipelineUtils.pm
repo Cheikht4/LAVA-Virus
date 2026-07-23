@@ -48,6 +48,7 @@ our @EXPORT_OK = qw(
   set_pipeline_threads
   injectFixedPrimers
   findPrimerPositionInAlignment
+  computeFixedPrimerWindows
 );
 
 use LLNL::LAVA::Constants ":standard";
@@ -2177,6 +2178,99 @@ sub injectFixedPrimers {
   }
 
   return \%result;
+}
+
+#-------------------------------------------------------------------------------
+
+=head2 computeFixedPrimerWindows
+
+  Calcule la fenetre genomique valide pour chaque type d amorce LAMP en fonction
+  des amorces fixees par l utilisateur.
+  Computes the valid genomic window for each LAMP primer type based on user-fixed primers.
+
+  Principe / Principle:
+    Toute amorce fixee contraint geometriquement la position de toutes les autres.
+    Approche conservative : fenetre = [P - sig_max - margin, P + sig_max + margin]
+    intersection de toutes les contraintes des amorces fixees.
+    Les candidats hors-fenetre sont geometriquement impossibles meme avec la sigmoide.
+    Any fixed primer geometrically constrains all other primers.
+    Conservative approach: window = [P - sig_max - margin, P + sig_max + margin]
+    intersection of all fixed primer constraints.
+    Out-of-window candidates are geometrically impossible even with sigmoid penalty.
+
+  Arguments:
+    fixed_specs_ref - Arrayref de specs resolues { type, seq, pos (resolu) }
+    sig_max         - Longueur maximale de la signature (ex: 400 nt)
+    margin          - Marge de securite en nt (defaut: 200)
+    aln_length      - Longueur totale de l alignement
+
+  Returns:
+    Hashref { type => [min_pos, max_pos] } ou {} si aucune contrainte applicable.
+
+=cut
+
+sub computeFixedPrimerWindows {
+  my ($fixed_specs_ref, $sig_max, $margin, $aln_length) = @_;
+
+  $margin //= 200;
+  my %windows;
+
+  return {} unless defined $fixed_specs_ref && @{$fixed_specs_ref};
+
+  # Tous les types d amorces LAMP traites par les scripts / All LAMP primer types handled
+  my @all_types = qw(F3 F2 F1C B1C B2 B3 FLOOP BLOOP FSTEM BSTEM);
+
+  # Fenetre globale initiale = toute la longueur / Initial global window = full length
+  my $global_min = 0;
+  my $global_max = defined $aln_length ? $aln_length : 999_999;
+
+  my $window_width = $sig_max + $margin;
+  my $has_resolved = 0;
+
+  foreach my $spec (@{$fixed_specs_ref}) {
+    my $pos = $spec->{pos};
+    next unless defined $pos;  # position non resolue = pas de contrainte / unresolved = no constraint
+    $has_resolved = 1;
+
+    # Fenetre de la contrainte de cette amorce fixee
+    # Constraint window for this fixed primer
+    my $cmin = $pos - $window_width;
+    my $cmax = $pos + $window_width;
+    $cmin = 0              if $cmin < 0;
+    $cmax = $aln_length    if defined $aln_length && $cmax > $aln_length;
+
+    # Intersection avec la fenetre globale courante / Intersect with current global window
+    $global_min = $cmin if $cmin > $global_min;
+    $global_max = $cmax if $cmax < $global_max;
+
+    printf("[FIXED PRIMER WINDOW] Amorce %s@%d -> fenetre contrainte [%d, %d] (sig_max=%d + marge=%d)\n",
+           $spec->{type}, $pos, $cmin, $cmax, $sig_max, $margin);
+    printf("[FIXED PRIMER WINDOW] Primer %s@%d -> constraint window [%d, %d] (sig_max=%d + margin=%d)\n",
+           $spec->{type}, $pos, $cmin, $cmax, $sig_max, $margin);
+  }
+
+  return {} unless $has_resolved;
+
+  if ($global_min >= $global_max) {
+    print "[FIXED PRIMER WINDOW] AVERTISSEMENT: Fenetre globale invalide [$global_min, $global_max]. Contraintes incompatibles. Filtrage desactive.\n";
+    print "[FIXED PRIMER WINDOW] WARNING: Invalid global window [$global_min, $global_max]. Incompatible constraints. Filtering disabled.\n";
+    return {};
+  }
+
+  my $pct = (defined $aln_length && $aln_length > 0)
+              ? sprintf("%.1f%%", 100.0 * ($global_max - $global_min) / $aln_length)
+              : "N/A";
+  printf("[FIXED PRIMER WINDOW] Fenetre globale retenue : [%d, %d] (%s de l alignement)\n",
+         $global_min, $global_max, $pct);
+  printf("[FIXED PRIMER WINDOW] Global window retained  : [%d, %d] (%s of alignment)\n",
+         $global_min, $global_max, $pct);
+
+  # Appliquer la fenetre globale a tous les types / Apply global window to all types
+  foreach my $type (@all_types) {
+    $windows{$type} = [$global_min, $global_max];
+  }
+
+  return \%windows;
 }
 
 1;

@@ -465,6 +465,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   # Types valides STEM : F3 B3 F2 B2 F1C B1C FSTEM BSTEM
   # Valid types STEM:   F3 B3 F2 B2 F1C B1C FSTEM BSTEM
   my @fixedPrimerSpecs = ();
+  my $fixedPrimerWindows_r = {};  # Fenetre geometrique calculee / Computed geometric window
   my @raw_fixed = @{ $options{"fixed_primer"} // [] };
   for my $raw (@raw_fixed) {
     my @parts = split(/:/, $raw, 3);
@@ -811,6 +812,32 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
 
   my $sequenceLength = $inputMSA->length;
 
+  # --- Resolution anticipee des positions des amorces fixees ---
+  # --- Early position resolution for fixed primers ---
+  # On resout les positions maintenant (avant Primer3) pour pouvoir calculer
+  # la fenetre geometrique et filtrer les candidats AVANT leur generation.
+  if (@fixedPrimerSpecs) {
+    print "\n[FIXED PRIMER WINDOW] Resolution anticipee des positions / Early position resolution...\n";
+    for my $spec (@fixedPrimerSpecs) {
+      next if defined $spec->{pos};  # position deja fournie / already provided
+      my ($found_pos, $found_strand) = findPrimerPositionInAlignment($inputMSA, $spec->{seq}, undef);
+      if (defined $found_pos) {
+        $spec->{pos}    = $found_pos;
+        $spec->{strand} = $found_strand;
+        printf("[FIXED PRIMER WINDOW] %s '%s' -> position resolue : %d (brin %s)\n",
+               $spec->{type}, $spec->{seq}, $found_pos, $found_strand);
+      } else {
+        print "[FIXED PRIMER WINDOW] AVERTISSEMENT: position introuvable pour $spec->{type} '$spec->{seq}'. Fenetre non contrainte pour cette amorce.\n";
+      }
+    }
+
+    my $fixed_window_margin = optionWithDefault($options_r, "fixed_primer_margin", 200);
+    my $current_sig_max = optionWithDefault($options_r, "signature_max_length", 400);
+    $fixedPrimerWindows_r = computeFixedPrimerWindows(
+      \@fixedPrimerSpecs, $current_sig_max, $fixed_window_margin, $sequenceLength
+    );
+  }
+
   # Extraire les séquences du MSA pour la validation d'intersection commune / Extract MSA sequences for common intersection validation
   my @sequences = ();
   my @sequence_names = ();
@@ -1034,6 +1061,48 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   my $middlePrimerAnalyzer = $outerPrimerAnalyzer;
   my $innerPrimerAnalyzer = $outerPrimerAnalyzer;
   my $stemPrimerAnalyzer = $outerPrimerAnalyzer;
+
+  # --- FILTRAGE GEOMETRIQUE PAR FENETRE (si amorces fixees) ---
+  # --- GEOMETRIC WINDOW FILTERING (if fixed primers are defined) ---
+  # Elimination des candidats geometriquement impossibles AVANT l'injection.
+  if (%{$fixedPrimerWindows_r}) {
+    my $win_F3    = $fixedPrimerWindows_r->{"F3"}    // [0, 999_999];
+    my $win_B3    = $fixedPrimerWindows_r->{"B3"}    // [0, 999_999];
+    my $win_F2    = $fixedPrimerWindows_r->{"F2"}    // [0, 999_999];
+    my $win_B2    = $fixedPrimerWindows_r->{"B2"}    // [0, 999_999];
+    my $win_F1C   = $fixedPrimerWindows_r->{"F1C"}   // [0, 999_999];
+    my $win_B1C   = $fixedPrimerWindows_r->{"B1C"}   // [0, 999_999];
+    my $win_FSTEM = $fixedPrimerWindows_r->{"FSTEM"} // [0, 999_999];
+    my $win_BSTEM = $fixedPrimerWindows_r->{"BSTEM"} // [0, 999_999];
+
+    my $before_fwd_outer  = scalar(@outerForwardPrimers);
+    my $before_rev_outer  = scalar(@outerReversePrimers);
+    my $before_fwd_middle = scalar(@middleForwardPrimers);
+    my $before_rev_middle = scalar(@middleReversePrimers);
+    my $before_fwd_inner  = scalar(@innerForwardPrimers);
+    my $before_rev_inner  = scalar(@innerReversePrimers);
+    my $before_fwd_stem   = scalar(@stemForwardPrimers);
+    my $before_rev_stem   = scalar(@stemBackPrimers);
+
+    @outerForwardPrimers  = grep { $_->location() >= $win_F3->[0]    && $_->location() <= $win_F3->[1]    } @outerForwardPrimers;
+    @outerReversePrimers  = grep { $_->location() >= $win_B3->[0]    && $_->location() <= $win_B3->[1]    } @outerReversePrimers;
+    @middleForwardPrimers = grep { $_->location() >= $win_F2->[0]    && $_->location() <= $win_F2->[1]    } @middleForwardPrimers;
+    @middleReversePrimers = grep { $_->location() >= $win_B2->[0]    && $_->location() <= $win_B2->[1]    } @middleReversePrimers;
+    @innerForwardPrimers  = grep { $_->location() >= $win_F1C->[0]   && $_->location() <= $win_F1C->[1]   } @innerForwardPrimers;
+    @innerReversePrimers  = grep { $_->location() >= $win_B1C->[0]   && $_->location() <= $win_B1C->[1]   } @innerReversePrimers;
+    @stemForwardPrimers   = grep { $_->location() >= $win_FSTEM->[0] && $_->location() <= $win_FSTEM->[1] } @stemForwardPrimers;
+    @stemBackPrimers      = grep { $_->location() >= $win_BSTEM->[0] && $_->location() <= $win_BSTEM->[1] } @stemBackPrimers;
+
+    printf("[FIXED PRIMER WINDOW] Filtrage STEM terminé / STEM filtering done:\n");
+    printf("  F3:    %d -> %d | B3:    %d -> %d\n", $before_fwd_outer,  scalar(@outerForwardPrimers),
+                                                     $before_rev_outer,  scalar(@outerReversePrimers));
+    printf("  F2:    %d -> %d | B2:    %d -> %d\n", $before_fwd_middle, scalar(@middleForwardPrimers),
+                                                     $before_rev_middle, scalar(@middleReversePrimers));
+    printf("  F1c:   %d -> %d | B1c:   %d -> %d\n", $before_fwd_inner,  scalar(@innerForwardPrimers),
+                                                     $before_rev_inner,  scalar(@innerReversePrimers));
+    printf("  FSTEM: %d -> %d | BSTEM: %d -> %d\n", $before_fwd_stem, scalar(@stemForwardPrimers),
+                                                     $before_rev_stem, scalar(@stemBackPrimers));
+  }
 
   # --- INJECTION DES AMORCES FIXEES dans les pools correspondants ---
   # --- INJECT FIXED PRIMERS into the corresponding pools ---

@@ -91,7 +91,7 @@ use LLNL::LAVA::PrimerSetInfo::PCRPair;
 use LLNL::LAVA::PrimerSet::LAMP;
 use LLNL::LAVA::Core qw(generateDistancePenalties calculate_proportional_geometry generateSigmoidPenalty countDegenerateBases);
 use LLNL::LAVA::Validator qw(checkPrimerMismatchTolerance getPrimerTargetedSequences isIUPACCompatible rev_comp generateIUPACCode validateCompleteSignatureSpacing);
-use LLNL::LAVA::PipelineUtils qw(getOligosWithMismatchTolerance set_pipeline_threads buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths injectFixedPrimers findPrimerPositionInAlignment); # buildReversePrimers retire (DEPRECATED, remplace par buildNativeReversePool)
+use LLNL::LAVA::PipelineUtils qw(getOligosWithMismatchTolerance set_pipeline_threads buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths injectFixedPrimers findPrimerPositionInAlignment computeFixedPrimerWindows); # buildReversePrimers retire (DEPRECATED, remplace par buildNativeReversePool)
 use LLNL::LAVA::ForkManager;
 
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
@@ -456,6 +456,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   # Types valides LOOP : F3 B3 F2 B2 F1C B1C FLOOP BLOOP
   # Valid types LOOP:   F3 B3 F2 B2 F1C B1C FLOOP BLOOP
   my @fixedPrimerSpecs = ();
+  my $fixedPrimerWindows_r = {};  # Fenetre geometrique calculee / Computed geometric window
   my @raw_fixed = @{ $options{"fixed_primer"} // [] };
   for my $raw (@raw_fixed) {
     my @parts = split(/:/, $raw, 3);
@@ -813,6 +814,36 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   }
 
   my $sequenceLength = $inputMSA->length;
+
+  # --- Resolution anticipee des positions des amorces fixees ---
+  # --- Early position resolution for fixed primers ---
+  # On resout les positions maintenant (avant Primer3) pour pouvoir calculer
+  # la fenetre geometrique et filtrer les candidats AVANT leur generation.
+  # We resolve positions now (before Primer3) to compute the geometric window
+  # and filter candidates BEFORE their generation.
+  if (@fixedPrimerSpecs) {
+    print "\n[FIXED PRIMER WINDOW] Resolution anticipee des positions / Early position resolution...\n";
+    for my $spec (@fixedPrimerSpecs) {
+      next if defined $spec->{pos};  # position deja fournie / already provided
+      my ($found_pos, $found_strand) = findPrimerPositionInAlignment($inputMSA, $spec->{seq}, undef);
+      if (defined $found_pos) {
+        $spec->{pos}    = $found_pos;
+        $spec->{strand} = $found_strand;
+        printf("[FIXED PRIMER WINDOW] %s '%s' -> position resolue : %d (brin %s)\n",
+               $spec->{type}, $spec->{seq}, $found_pos, $found_strand);
+      } else {
+        print "[FIXED PRIMER WINDOW] AVERTISSEMENT: position introuvable pour $spec->{type} '$spec->{seq}'. Fenetre non contrainte pour cette amorce.\n";
+        print "[FIXED PRIMER WINDOW] WARNING: position not found for $spec->{type} '$spec->{seq}'. No window constraint for this primer.\n";
+      }
+    }
+
+    my $fixed_window_margin = optionWithDefault($options_r, "fixed_primer_margin", 200);
+    my $current_sig_max = optionWithDefault($options_r, "signature_max_length", 320);
+    $fixedPrimerWindows_r = computeFixedPrimerWindows(
+      \@fixedPrimerSpecs, $current_sig_max, $fixed_window_margin, $sequenceLength
+    );
+  }
+
   
   # Extraire les objets de séquence pour la génération des fichiers FASTA / Extract sequence objects for FASTA file generation
   my @sequence_objects = ();
@@ -1045,8 +1076,53 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
   my $middlePrimerAnalyzer = $outerPrimerAnalyzer;
   my $innerPrimerAnalyzer = $outerPrimerAnalyzer;
   my $loopPrimerAnalyzer = $outerPrimerAnalyzer;
+  # --- FILTRAGE GEOMETRIQUE PAR FENETRE (si amorces fixees) ---
+  # --- GEOMETRIC WINDOW FILTERING (if fixed primers are defined) ---
+  # Elimination des candidats geometriquement impossibles AVANT l'injection.
+  # Eliminating geometrically impossible candidates BEFORE injection.
+  # Note: la penalite sigmoide reste inchangee pour les candidats dans la marge.
+  # Note: sigmoid penalty remains unchanged for candidates within the margin.
+  if (%{$fixedPrimerWindows_r}) {
+    my $win_F3    = $fixedPrimerWindows_r->{"F3"}    // [0, 999_999];
+    my $win_B3    = $fixedPrimerWindows_r->{"B3"}    // [0, 999_999];
+    my $win_F2    = $fixedPrimerWindows_r->{"F2"}    // [0, 999_999];
+    my $win_B2    = $fixedPrimerWindows_r->{"B2"}    // [0, 999_999];
+    my $win_F1C   = $fixedPrimerWindows_r->{"F1C"}   // [0, 999_999];
+    my $win_B1C   = $fixedPrimerWindows_r->{"B1C"}   // [0, 999_999];
+    my $win_FLOOP = $fixedPrimerWindows_r->{"FLOOP"} // [0, 999_999];
+    my $win_BLOOP = $fixedPrimerWindows_r->{"BLOOP"} // [0, 999_999];
+
+    my $before_fwd_outer  = scalar(@outerForwardPrimers);
+    my $before_rev_outer  = scalar(@outerReversePrimers);
+    my $before_fwd_middle = scalar(@middleForwardPrimers);
+    my $before_rev_middle = scalar(@middleReversePrimers);
+    my $before_fwd_inner  = scalar(@innerForwardPrimers);
+    my $before_rev_inner  = scalar(@innerReversePrimers);
+    my $before_floop      = scalar(@loopForwardPrimers);
+    my $before_bloop      = scalar(@loopBackPrimers);
+
+    @outerForwardPrimers  = grep { $_->location() >= $win_F3->[0]    && $_->location() <= $win_F3->[1]    } @outerForwardPrimers;
+    @outerReversePrimers  = grep { $_->location() >= $win_B3->[0]    && $_->location() <= $win_B3->[1]    } @outerReversePrimers;
+    @middleForwardPrimers = grep { $_->location() >= $win_F2->[0]    && $_->location() <= $win_F2->[1]    } @middleForwardPrimers;
+    @middleReversePrimers = grep { $_->location() >= $win_B2->[0]    && $_->location() <= $win_B2->[1]    } @middleReversePrimers;
+    @innerForwardPrimers  = grep { $_->location() >= $win_F1C->[0]   && $_->location() <= $win_F1C->[1]   } @innerForwardPrimers;
+    @innerReversePrimers  = grep { $_->location() >= $win_B1C->[0]   && $_->location() <= $win_B1C->[1]   } @innerReversePrimers;
+    @loopForwardPrimers   = grep { $_->location() >= $win_FLOOP->[0] && $_->location() <= $win_FLOOP->[1] } @loopForwardPrimers;
+    @loopBackPrimers      = grep { $_->location() >= $win_BLOOP->[0] && $_->location() <= $win_BLOOP->[1] } @loopBackPrimers;
+
+    printf("[FIXED PRIMER WINDOW] Filtrage LOOP terminé / LOOP filtering done:\n");
+    printf("  F3:    %d -> %d | B3:    %d -> %d\n", $before_fwd_outer,  scalar(@outerForwardPrimers),
+                                                     $before_rev_outer,  scalar(@outerReversePrimers));
+    printf("  F2:    %d -> %d | B2:    %d -> %d\n", $before_fwd_middle, scalar(@middleForwardPrimers),
+                                                     $before_rev_middle, scalar(@middleReversePrimers));
+    printf("  F1c:   %d -> %d | B1c:   %d -> %d\n", $before_fwd_inner,  scalar(@innerForwardPrimers),
+                                                     $before_rev_inner,  scalar(@innerReversePrimers));
+    printf("  FLOOP: %d -> %d | BLOOP: %d -> %d\n", $before_floop, scalar(@loopForwardPrimers),
+                                                     $before_bloop, scalar(@loopBackPrimers));
+  }
 
   # --- INJECTION DES AMORCES FIXEES dans les pools correspondants ---
+
   # --- INJECT FIXED PRIMERS into the corresponding pools ---
   if (@fixedPrimerSpecs) {
     print "\n=== Injection des amorces fixees / Fixed Primer Injection ===\n";
