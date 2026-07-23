@@ -1922,3 +1922,10 @@ exactement a la cinetique reelle d'une reaction LAMP (limitee spatialement a ~40
 - Elimination precoce des faux candidats spatiaux.
 - Aucune regression : 7/7 tests canary passes.
 
+
+### Date/Étape : 2026-07-23 / Correction Bug Module (PipelineUtils)
+- **Fichiers impactés** : `lib/LLNL/LAVA/PipelineUtils.pm`
+- **Nature du changement** : [Bug Fix]
+- **Explication technique** : Les subroutines `findPrimerPositionInAlignment` et `computeFixedPrimerWindows` avaient été ajoutées en fin de fichier à la suite de la balise `__END__`. En Perl, le parseur ignore tout le code source situé après cette balise (réservée pour la section `DATA` ou la documentation POD), ce qui entraînait une erreur fatale `Undefined subroutine` à l'exécution de `lava_loop_primer.pl` et `lava_stem_primer.pl` malgré la réussite du contrôle syntaxique (`perl -c`). La balise `__END__` et la documentation POD ont été repoussées à la toute fin absolue du fichier.
+- **Justification biologique** : Restauration de la mécanique de pré-filtrage géométrique (fenêtrage de séquence) pour le positionnement des amorces fixées expérimentalement, cruciale pour cibler avec précision des régions conservées (e.g. gènes essentiels) des virus.
+- **Impact attendu** : L'intégration des amorces fixées fonctionnera à nouveau sans interrompre brutalement l'exécution du pipeline LAVA.
