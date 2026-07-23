@@ -1936,20 +1936,6 @@ sub createAmplificationFiles {
   return ($amplified_file, $excluded_file);
 }
 
-1;
-
-__END__
-
-=head1 AUTHOR
-
-LAVA-DNA Fork (2026) - Code audit Phase 34-36
-
-=head1 SEE ALSO
-
-L<LLNL::LAVA::Core>, L<LLNL::LAVA::Validator>
-
-=cut
-
 #-------------------------------------------------------------------------------
 
 =head2 findPrimerPositionInAlignment
@@ -2274,3 +2260,15 @@ sub computeFixedPrimerWindows {
 }
 
 1;
+
+__END__
+
+=head1 AUTHOR
+
+LAVA-DNA Fork (2026) - Code audit Phase 34-36
+
+=head1 SEE ALSO
+
+L<LLNL::LAVA::Core>, L<LLNL::LAVA::Validator>
+
+=cut
