@@ -838,6 +838,18 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
     );
   }
 
+  my $global_included_region = undef;
+  if (%{$fixedPrimerWindows_r}) {
+    my $win = $fixedPrimerWindows_r->{"F3"};
+    if (defined $win) {
+      my $len = $win->[1] - $win->[0] + 1;
+      if ($len > 0) {
+        $global_included_region = $win->[0] . "," . $len;
+        print "[FIXED PRIMER WINDOW] Passing SEQUENCE_INCLUDED_REGION=$global_included_region to Primer3\n";
+      }
+    }
+  }
+
   # Extraire les séquences du MSA pour la validation d'intersection commune / Extract MSA sequences for common intersection validation
   my @sequences = ();
   my @sequence_names = ();
@@ -877,6 +889,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   print "Enumerating outer forward primers\n";
@@ -923,6 +936,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   # This difference in naming is intentional for now (stemBackPrimers instead of 
@@ -987,6 +1001,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   print "Enumerating middle forward primers\n";
@@ -1028,6 +1043,7 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   print "Enumerating inner forward primers\n";

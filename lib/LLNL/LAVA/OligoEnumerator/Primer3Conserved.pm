@@ -129,6 +129,7 @@ sub new
     "thermodynamic_alignment" => "PRIMER_THERMODYNAMIC_ALIGNMENT",
     "thermodynamic_path" => "PRIMER_THERMODYNAMIC_PARAMETERS_PATH",
     "excluded_regions" => "SEQUENCE_EXCLUDED_REGION",
+    "included_region" => "SEQUENCE_INCLUDED_REGION",
   };
 
   # Set of default primer3 targets (primer3 target name => value)
