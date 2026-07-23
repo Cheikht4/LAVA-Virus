@@ -128,8 +128,8 @@ sub new
     "salt_corrections" => "PRIMER_SALT_CORRECTIONS",
     "thermodynamic_alignment" => "PRIMER_THERMODYNAMIC_ALIGNMENT",
     "thermodynamic_path" => "PRIMER_THERMODYNAMIC_PARAMETERS_PATH",
-    "excluded_regions" => "SEQUENCE_EXCLUDED_REGION",
-    "included_region" => "SEQUENCE_INCLUDED_REGION",
+    "excluded_regions" => "EXCLUDED_REGION",
+    "included_region" => "INCLUDED_REGION",
   };
 
   # Set of default primer3 targets (primer3 target name => value)
@@ -367,7 +367,7 @@ sub getOligos
       foreach my $reg (@excludedRegions) {
           push(@regionsStrs, $reg->[0] . "," . $reg->[1]);
       }
-      $primer3->add_targets("SEQUENCE_EXCLUDED_REGION" => join(" ", @regionsStrs));
+      $primer3->add_targets("EXCLUDED_REGION" => join(" ", @regionsStrs));
   }
 
   my $primer3Results_r = $primer3->run();
