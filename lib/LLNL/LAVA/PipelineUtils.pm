@@ -23,6 +23,7 @@ package LLNL::LAVA::PipelineUtils;
 use strict;
 use warnings;
 use Carp;
+$| = 1;  # Autoflush STDOUT pour un envoi en temps réel des logs et de la progression vers Flask
 
 use Exporter 'import';
 our @EXPORT_OK = qw(
@@ -40,14 +41,22 @@ our @EXPORT_OK = qw(
   createAmplificationFiles
   analyzeSignatureCombinations
   generateCombinations
-  calculateDynamicPairLengths
   reducePrimersByWindow
   buildNativeReversePool
+  getOligosWithMismatchTolerance
+  set_pipeline_threads
+  injectFixedPrimers
+  findPrimerPositionInAlignment
+  computeFixedPrimerWindows
+  getPrimer3ParamsForType
 );
 
 use LLNL::LAVA::Constants ":standard";
 use LLNL::LAVA::Options ":standard";
 use LLNL::LAVA::PrimerSet::PCRPair;
+use LLNL::LAVA::ForkManager;
+use LLNL::LAVA::Oligo;
+use LLNL::LAVA::Validator qw(checkPrimerMismatchTolerance isIUPACCompatible rev_comp generateIUPACCode validateCompleteSignatureSpacing);
 use Bio::SeqIO;
 use POSIX qw(floor);
 use Time::HiRes qw(time);
@@ -55,6 +64,13 @@ use IO::Handle;
 STDERR->autoflush(1);
 # Detection TTY pour barre en place (comme tqdm) / TTY detection for in-place bar (like tqdm)
 our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
+
+our $THREADS = 1;
+sub set_pipeline_threads {
+  my ($th) = @_;
+  $THREADS = $th if defined $th;
+}
+
 
 # Auto-detection de Term::ProgressBar (equivalent tqdm) / Auto-detect Term::ProgressBar (tqdm equivalent)
 # Si le module n'est pas installe, on utilise une barre ASCII maison sans dependance externe.
@@ -69,6 +85,11 @@ our $HAS_TERM_PROGRESSBAR = eval { require Term::ProgressBar; Term::ProgressBar-
 sub _make_progress_bar {
   my ($total, $label) = @_;
   $label //= "Traitement";
+  my $t0 = time();
+
+  # Émission immédiate de la ligne LAVA-PROGRESS à 0% dès le lancement de l'étape pour informer Flask
+  printf("[LAVA-PROGRESS] %s|0|%d||? it/s|0\n", $label, $total // 1);
+  my $old_handle = select(STDOUT); $| = 1; select($old_handle);
 
   if ($HAS_TERM_PROGRESSBAR && -t STDOUT) {
     # Mode riche : Term::ProgressBar avec ETA / Rich mode: Term::ProgressBar with ETA
@@ -80,10 +101,9 @@ sub _make_progress_bar {
       fh     => \*STDERR,
     });
     $bar->minor(0);
-    return { type => 'term', bar => $bar, total => $total, done => 0 };
+    return { type => 'term', bar => $bar, total => $total, done => 0, label => $label, t0 => $t0 };
   } else {
     # Mode fallback : barre ASCII maison / Fallback mode: built-in ASCII bar
-    my $t0 = time();
     return {
       type   => 'ascii',
       total  => $total,
@@ -104,30 +124,15 @@ sub _make_progress_bar {
 sub _update_progress {
   my ($bar_r, $done, $extra_r) = @_;
   $bar_r->{done} = $done;
-  my $total = $bar_r->{total};
+  my $total = $bar_r->{total} // 1;
 
-  if ($bar_r->{type} eq 'term') {
+  if ($bar_r->{type} eq 'term' && defined $bar_r->{bar}) {
     $bar_r->{bar}->update($done);
-    return;
   }
 
-  # Fallback ASCII : afficher toutes les 200 iterations ou a 100%
-  # Fallback ASCII: print every 200 iterations or at 100%
-  return if ($done % 200 != 0 && $done != $total);
-
+  # Nous ne filtrons plus les mises à jour par modulo 200 afin de ne pas masquer le suivi en temps réel sous Flask
   my $now     = time();
-  my $elapsed = $now - $bar_r->{t0} + 0.001;
-  my $pct     = $total > 0 ? int($done / $total * 100) : 0;
-  my $filled  = int($pct / 5);   # 20 segments
-  my $empty   = 20 - $filled;
-  my $bar_str = "#" x $filled . "-" x $empty;
-
-  my $eta_str = "";
-  if ($done > 0 && $done < $total) {
-    my $rate    = $done / $elapsed;
-    my $remain  = ($total - $done) / $rate;
-    $eta_str = sprintf(" ETA:%ds", int($remain));
-  }
+  my $elapsed = $now - ($bar_r->{t0} // $now) + 0.001;
 
   my $extra_str = "";
   if ($extra_r) {
@@ -138,14 +143,13 @@ sub _update_progress {
     $extra_str = " | " . join(" ", @parts) if @parts;
   }
 
-  # Emission vers STDOUT pour Flask (toujours, pas seulement en TTY)
-  # Emit to STDOUT for Flask (always, not only in TTY)
   my $rate_str = ($done > 0 && $elapsed > 0) ? sprintf('%.0f it/s', $done / $elapsed) : '? it/s';
   my $eta_val  = ($done > 0 && $done < $total && $elapsed > 0)
                  ? int(($total - $done) / ($done / $elapsed)) : 0;
   printf("[LAVA-PROGRESS] %s|%d|%d|%s|%s|%d\n",
          $bar_r->{label} // 'Reverse Validation', $done, $total,
          $extra_str, $rate_str, $eta_val);
+  my $old_handle = select(STDOUT); $| = 1; select($old_handle);
 }
 
 sub _finish_progress {
@@ -185,10 +189,10 @@ is automatically applied to both pipelines.
 
 =head2 buildReversePrimers (DEPRECATED)
 
-B<DEPRECATED> - Cette fonction est conservée pour compatibilité ascendante uniquement.
+B<DEPRECATED> — Cette fonction est conservée pour compatibilité ascendante uniquement.
 Elle ne doit plus être appelée dans les nouveaux scripts.
 
-B<DEPRECATED> - This function is retained for backward compatibility only.
+B<DEPRECATED> — This function is retained for backward compatibility only.
 It must not be called in new scripts.
 
 Utiliser buildNativeReversePool à la place, qui génère nativement les amorces
@@ -217,6 +221,177 @@ sub buildReversePrimers
 }
 
 #-------------------------------------------------------------------------------
+
+=head2 getOligosWithMismatchTolerance
+
+  Version amelioree de getOligos qui integre la tolerance aux mismatches en multi-coeurs via ForkManager.
+  Improved version of getOligos that integrates mismatch tolerance using multi-core ForkManager.
+
+=cut
+
+sub getOligosWithMismatchTolerance {
+  my ($enumerator, $alignment, $min_match_percent, $min_iupac_percent, $min_primer_coverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, $label, $threads) = @_;
+  
+  $label //= "Forward";
+  my $progress_label = "Validation $label";
+  my $num_threads = $threads // $THREADS // 1;
+  
+  my $sequenceCount = $alignment->num_sequences();
+  if ($sequenceCount <= 0) {
+    confess("data error - MSA must contain at least one sequence");
+  }
+  
+  print "INFO: Utilisation de la tolerance aux mismatches activee en multi-coeurs (threads: $num_threads)\n";
+  print "  - Seuil de concordance stricte / Strict match threshold: ${min_match_percent}%\n";
+  print "  - Seuil de couverture IUPAC / IUPAC coverage threshold: ${min_iupac_percent}%\n";
+  
+  my @sequences = ();
+  foreach my $sequence ($alignment->each_seq()) {
+    my $seqContent = $sequence->seq();
+    $seqContent = uc($seqContent);
+    $seqContent =~ s/[^ATCG]/N/g;
+    push @sequences, $seqContent;
+  }
+  
+  # LAVA 2026: Fractionnement physique pour éviter le bug d'INCLUDED_REGION ignoré par Primer3
+  my $original_included_region = $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"};
+  my $slice_offset = 0;
+  my $targetAlignment = $alignment;
+  
+  if ($original_included_region) {
+    my ($start, $len) = split(/,/, $original_included_region);
+    my $slice_start_1based = $start + 1;
+    my $slice_end_1based   = $start + $len;
+    my $alignmentLength    = $alignment->length();
+    
+    if ($slice_end_1based > $alignmentLength) { $slice_end_1based = $alignmentLength; }
+    
+    $targetAlignment = $alignment->slice($slice_start_1based, $slice_end_1based);
+    $slice_offset = $start;
+    
+    print "  [$label] Fractionnement physique de l'alignement : $slice_start_1based à $slice_end_1based\n";
+    delete $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"};
+  }
+
+  my @candidatePrimers = $enumerator->getOligos($targetAlignment);
+  
+  if ($original_included_region) {
+    $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"} = $original_included_region;
+  }
+  
+  if ($slice_offset > 0) {
+      foreach my $primer (@candidatePrimers) {
+          my $local_loc = $primer->location();
+          $primer->location($local_loc + $slice_offset);
+      }
+  }
+  my @validatedPrimers = ();
+  my $strict_count = 0;
+  my $degenerate_count = 0;
+  my $rejected_count = 0;
+  
+  my $nb_fwd_candidates = scalar(@candidatePrimers);
+  print "INFO: Analyse de $nb_fwd_candidates amorces candidates Forward avec tolerance aux mismatches...\n";
+
+  if ($nb_fwd_candidates == 0) {
+    return ();
+  }
+
+  my $fwd_progress = _make_progress_bar($nb_fwd_candidates, $progress_label);
+  my $pm = LLNL::LAVA::ForkManager->new($num_threads);
+  my $n_chunks = $pm->{max_processes} * 12;
+  $n_chunks = 25 if $n_chunks < 25;
+  $n_chunks = $nb_fwd_candidates if $n_chunks > $nb_fwd_candidates;
+
+  $pm->run_on_finish(sub {
+    my ($pid, $exit_code, $ident, $signal, $core, $data_ref) = @_;
+    if (defined $data_ref && ref($data_ref) eq 'HASH') {
+      push @validatedPrimers, @{$data_ref->{validated} // []};
+      $strict_count     += $data_ref->{strict}   // 0;
+      $degenerate_count += $data_ref->{degen}    // 0;
+      $rejected_count   += $data_ref->{rejected} // 0;
+      _update_progress($fwd_progress, $strict_count + $degenerate_count + $rejected_count,
+        { strict => $strict_count, degen => $degenerate_count, rejected => $rejected_count });
+    }
+  });
+
+  my $chunk_size = int(($nb_fwd_candidates + $n_chunks - 1) / $n_chunks);
+  for my $chunk_id (0 .. $n_chunks - 1) {
+    my $start_idx = $chunk_id * $chunk_size;
+    last if $start_idx >= $nb_fwd_candidates;
+    my $end_idx = ($chunk_id + 1) * $chunk_size - 1;
+    $end_idx = $nb_fwd_candidates - 1 if $end_idx >= $nb_fwd_candidates;
+
+    my $pid = $pm->start($chunk_id);
+    next if $pid;
+
+    my @chunk_validated = ();
+    my @chunk_logs = ();
+    my $chunk_strict = 0;
+    my $chunk_degen  = 0;
+    my $chunk_reject = 0;
+
+    for my $i ($start_idx .. $end_idx) {
+      my $primer = $candidatePrimers[$i];
+      my $location = $primer->location();
+      my $length = $primer->length();
+      my $original_sequence = $primer->sequence();
+      
+      my ($final_sequence, $coverage_percent, $is_degenerate, $compatible_seq_ids) = 
+        checkPrimerMismatchTolerance(\@sequences, $location, $length, $original_sequence,
+                                    $min_match_percent, $min_iupac_percent, $min_primer_coverage,
+                                    $maxTotalDegen, $maxConsecDegen, 
+                                    $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
+      
+      my $min_primer_acceptance = $min_primer_coverage;
+      if ($coverage_percent >= $min_primer_acceptance) {
+        my $validatedPrimer = $primer->clone();
+        
+        if ($is_degenerate) {
+          $validatedPrimer->sequence($final_sequence);
+          $validatedPrimer->setTag("is_degenerate", 1);
+          $validatedPrimer->setTag("original_sequence", $original_sequence);
+          $validatedPrimer->setTag("iupac_coverage", sprintf("%.1f", $coverage_percent));
+          $validatedPrimer->setTag("compatible_sequence_ids", $compatible_seq_ids);
+          $validatedPrimer->setTag("compatible_sequence_vec", _build_bit_vector($compatible_seq_ids));
+          $chunk_degen++;
+        } else {
+          $validatedPrimer->setTag("is_degenerate", 0);
+          $validatedPrimer->setTag("iupac_coverage", "100.0");
+          $validatedPrimer->setTag("compatible_sequence_ids", $compatible_seq_ids);
+          $validatedPrimer->setTag("compatible_sequence_vec", _build_bit_vector($compatible_seq_ids));
+          $chunk_strict++;
+        }
+        push @chunk_validated, $validatedPrimer;
+      } else {
+        $chunk_reject++;
+      }
+    }
+
+    $pm->finish(0, {
+      validated => \@chunk_validated,
+      strict    => $chunk_strict,
+      degen     => $chunk_degen,
+      rejected  => $chunk_reject
+    });
+  }
+
+  $pm->wait_all_children();
+  @validatedPrimers = sort { $a->location() <=> $b->location() || $a->length() <=> $b->length() } @validatedPrimers;
+
+  _finish_progress($fwd_progress);
+  print "  [Forward] Resultats / Results:\n";
+  print "    - Strictes / Strict: $strict_count\n";
+  print "    - Degenerees / Degenerate: $degenerate_count\n";
+  print "    - Rejetees / Rejected: $rejected_count\n";
+  print "    - Total valide / Total validated: " . scalar(@validatedPrimers) . "/" . scalar(@candidatePrimers) . "\n\n";
+
+  return @validatedPrimers;
+}
+
+#-------------------------------------------------------------------------------
+
 
 =head2 buildNativeReversePool
 
@@ -248,7 +423,11 @@ sub buildNativeReversePool {
       $min_match_percent, $min_iupac_percent, $min_primer_coverage,
       $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen,
       $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-      $checkPrimerMismatchTolerance_ref, $isIUPACCompatible_ref, $rev_comp_ref) = @_;
+      $checkPrimerMismatchTolerance_ref, $isIUPACCompatible_ref, $rev_comp_ref, $label, $threads) = @_;
+
+  $label //= "Reverse";
+  my $progress_label = "Validation $label";
+  my $num_threads = $threads // $THREADS // 1;
 
   # --- 1. Construire le RC de l alignement complet ---
   # Build the RC of the full alignment
@@ -285,7 +464,53 @@ sub buildNativeReversePool {
 
   # --- 3. Lancer Primer3 sur le RC de l alignement ---
   # Run Primer3 on the RC alignment (generates native minus-strand primers)
-  my @candidatePrimers = $enumerator->getOligos($rcAlignment);
+  
+  # LAVA 2026: Au lieu de faire confiance au paramètre INCLUDED_REGION (qui est ignoré
+  # silencieusement par Primer3 v2.6 pour les amorces internes pick_hyb_probe_only),
+  # on fractionne (slice) physiquement l'alignement RC, comme suggéré !
+  
+  my $original_included_region = $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"};
+  my $rc_slice_offset = 0;
+  my $targetAlignment = $rcAlignment;
+  
+  if ($original_included_region) {
+    my ($start, $len) = split(/,/, $original_included_region);
+    # BioPerl/Primer3 utilise des coordonnées 0-based.
+    # Ex: alignment = 11039 bases. start = 4128, len = 1201.
+    # Fin de la region sur brin plus = start + len = 4128 + 1201 = 5329.
+    # Nouveau start sur RC = alignmentLength - fin = 11039 - 5329 = 5710.
+    my $rc_start = $alignmentLength - ($start + $len);
+    if ($rc_start < 0) { $rc_start = 0; }
+    
+    # Bio::SimpleAlign->slice est 1-based et inclusif
+    my $slice_start_1based = $rc_start + 1;
+    my $slice_end_1based   = $rc_start + $len;
+    if ($slice_end_1based > $alignmentLength) { $slice_end_1based = $alignmentLength; }
+    
+    # FRACTIONNEMENT PHYSIQUE !
+    $targetAlignment = $rcAlignment->slice($slice_start_1based, $slice_end_1based);
+    $rc_slice_offset = $rc_start;
+    
+    print "  [NativeReverse] Fractionnement physique de l'alignement RC : $slice_start_1based à $slice_end_1based\n";
+    
+    # On supprime temporairement INCLUDED_REGION pour ne pas embrouiller Primer3
+    delete $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"};
+  }
+
+  my @candidatePrimers = $enumerator->getOligos($targetAlignment);
+  
+  # Restaurer INCLUDED_REGION
+  if ($original_included_region) {
+    $enumerator->{"d_primer3Targets"}->{"INCLUDED_REGION"} = $original_included_region;
+  }
+  
+  # AJUSTER LES COORDONNÉES DES CANDIDATS (car elles sont relatives au sous-alignement)
+  if ($rc_slice_offset > 0) {
+      foreach my $primer (@candidatePrimers) {
+          my $local_loc = $primer->location();
+          $primer->location($local_loc + $rc_slice_offset);
+      }
+  }
   print "  [NativeReverse] Primer3 a genere / generated " . scalar(@candidatePrimers) . " candidats sur RC MSA\n";
 
   # --- 4. Valider chaque candidat contre les sequences RC ---
@@ -296,70 +521,100 @@ sub buildNativeReversePool {
   my $rejected_count = 0;
 
   my $nb_rev_candidates = scalar(@candidatePrimers);
-  print "INFO: [NativeReverse] Analyse de $nb_rev_candidates amorces candidates Reverse...\n";
+  print "INFO: [NativeReverse] Analyse de $nb_rev_candidates amorces candidates Reverse en multi-coeurs (threads: $num_threads)...\n";
   print "  - Strict match: ${min_match_percent}% | IUPAC: ${min_iupac_percent}% | Coverage: ${min_primer_coverage}%\n";
   print "  - MaxDegen: $maxTotalDegen total / $max3PrimeDegen au 3prime\n";
 
-  # Barre de progression / Progress bar (Term::ProgressBar ou fallback ASCII)
-  my $rev_progress = _make_progress_bar($nb_rev_candidates, "Reverse Validation");
-
-  foreach my $primer (@candidatePrimers) {
-    my $posInRC  = $primer->location();  # Position 0-indexee dans RC(Seq1)
-    my $length   = $primer->length();
-    my $origSeq  = $primer->sequence();
-
-    # Validation contre les sequences RC avec tous les parametres identiques aux Forward
-    # Validation against RC sequences with identical parameters as Forward primers
-    my ($finalSeq, $coveragePct, $isDegenerate, $compatibleIds) =
-      $checkPrimerMismatchTolerance_ref->(
-        \@rcSequences, $posInRC, $length, $origSeq,
-        $min_match_percent, $min_iupac_percent, $min_primer_coverage,
-        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen,
-        $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency
-      );
-
-    # --- 5. Convertir la position RC -> position genome original ---
-    # RC position p -> original genome position: alignmentLength - 1 - p (5' du brin -)
-    my $genomicLocation = $alignmentLength - 1 - $posInRC;
-
-    # Meme logique de rejet/acceptation que getOligosWithMismatchTolerance
-    # Same rejection/acceptance logic as getOligosWithMismatchTolerance
-    if ($coveragePct >= $min_primer_coverage) {
-      # Creer l objet Oligo natif en orientation minus / Create native Oligo in minus orientation
-      my $validatedPrimer = $primer->clone();
-      $validatedPrimer->sequence($finalSeq);
-      $validatedPrimer->location($genomicLocation);   # 5' du brin -, coordonnee originale
-      $validatedPrimer->setTag("strand", "minus");    # Brin moins natif
-
-      if ($isDegenerate) {
-        $validatedPrimer->setTag("is_degenerate", 1);
-        $validatedPrimer->setTag("original_sequence", $origSeq);
-        $validatedPrimer->setTag("iupac_coverage", sprintf("%.1f", $coveragePct));
-        $validatedPrimer->setTag("compatible_sequence_ids", $compatibleIds);
-        $degen_count++;
-        print "REVERSE DEGENERATE acceptee - PosRC: $posInRC -> GenomPos: $genomicLocation, Couv: " .
-              sprintf("%.1f", $coveragePct) . "%, Seq: $finalSeq\n";
-        _update_progress($rev_progress, $strict_count+$degen_count+$rejected_count,
-          { strict=>$strict_count, degen=>$degen_count, rejected=>$rejected_count });
-      } else {
-        $validatedPrimer->setTag("is_degenerate", 0);
-        $validatedPrimer->setTag("iupac_coverage", "100.0");
-        $validatedPrimer->setTag("compatible_sequence_ids", $compatibleIds);
-        $strict_count++;
-        print "REVERSE STRICT acceptee   - PosRC: $posInRC -> GenomPos: $genomicLocation, Couv: 100.0%, Seq: $finalSeq\n";
-        _update_progress($rev_progress, $strict_count+$degen_count+$rejected_count,
-          { strict=>$strict_count, degen=>$degen_count, rejected=>$rejected_count });
-      }
-
-      push @validatedPrimers, $validatedPrimer;
-    } else {
-      $rejected_count++;
-      print "REVERSE REJECTED           - PosRC: $posInRC -> GenomPos: $genomicLocation, Couv: " .
-            sprintf("%.1f", $coveragePct) . "% < ${min_primer_coverage}%\n";
-      _update_progress($rev_progress, $strict_count+$degen_count+$rejected_count,
-        { strict=>$strict_count, degen=>$degen_count, rejected=>$rejected_count });
-    }
+  if ($nb_rev_candidates == 0) {
+    return ();
   }
+
+  my $rev_progress = _make_progress_bar($nb_rev_candidates, $progress_label);
+  my $pm = LLNL::LAVA::ForkManager->new($num_threads);
+  my $n_chunks = $pm->{max_processes} * 12;
+  $n_chunks = 25 if $n_chunks < 25;
+  $n_chunks = $nb_rev_candidates if $n_chunks > $nb_rev_candidates;
+
+  $pm->run_on_finish(sub {
+    my ($pid, $exit_code, $ident, $signal, $core, $data_ref) = @_;
+    if (defined $data_ref && ref($data_ref) eq 'HASH') {
+      push @validatedPrimers, @{$data_ref->{validated} // []};
+      $strict_count   += $data_ref->{strict}   // 0;
+      $degen_count    += $data_ref->{degen}    // 0;
+      $rejected_count += $data_ref->{rejected} // 0;
+      _update_progress($rev_progress, $strict_count + $degen_count + $rejected_count,
+        { strict => $strict_count, degen => $degen_count, rejected => $rejected_count });
+    }
+  });
+
+  my $chunk_size = int(($nb_rev_candidates + $n_chunks - 1) / $n_chunks);
+  for my $chunk_id (0 .. $n_chunks - 1) {
+    my $start_idx = $chunk_id * $chunk_size;
+    last if $start_idx >= $nb_rev_candidates;
+    my $end_idx = ($chunk_id + 1) * $chunk_size - 1;
+    $end_idx = $nb_rev_candidates - 1 if $end_idx >= $nb_rev_candidates;
+
+    my $pid = $pm->start($chunk_id);
+    next if $pid;
+
+    my @chunk_validated = ();
+    my @chunk_logs = ();
+    my $chunk_strict = 0;
+    my $chunk_degen  = 0;
+    my $chunk_reject = 0;
+
+    for my $i ($start_idx .. $end_idx) {
+      my $primer = $candidatePrimers[$i];
+      my $posInRC  = $primer->location();
+      my $length   = $primer->length();
+      my $origSeq  = $primer->sequence();
+
+      my ($finalSeq, $coveragePct, $isDegenerate, $compatibleIds) =
+        $checkPrimerMismatchTolerance_ref->(
+          \@rcSequences, $posInRC, $length, $origSeq,
+          $min_match_percent, $min_iupac_percent, $min_primer_coverage,
+          $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen,
+          $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency
+        );
+
+      my $genomicLocation = $alignmentLength - 1 - $posInRC;
+
+      if ($coveragePct >= $min_primer_coverage) {
+        my $validatedPrimer = $primer->clone();
+        $validatedPrimer->sequence($finalSeq);
+        $validatedPrimer->location($genomicLocation);
+        $validatedPrimer->setTag("strand", "minus");
+
+        if ($isDegenerate) {
+          $validatedPrimer->setTag("is_degenerate", 1);
+          $validatedPrimer->setTag("original_sequence", $origSeq);
+          $validatedPrimer->setTag("iupac_coverage", sprintf("%.1f", $coveragePct));
+          $validatedPrimer->setTag("compatible_sequence_ids", $compatibleIds);
+          $validatedPrimer->setTag("compatible_sequence_vec", _build_bit_vector($compatibleIds));
+          $chunk_degen++;
+        } else {
+          $validatedPrimer->setTag("is_degenerate", 0);
+          $validatedPrimer->setTag("iupac_coverage", "100.0");
+          $validatedPrimer->setTag("compatible_sequence_ids", $compatibleIds);
+          $validatedPrimer->setTag("compatible_sequence_vec", _build_bit_vector($compatibleIds));
+          $chunk_strict++;
+        }
+        push @chunk_validated, $validatedPrimer;
+      } else {
+        $chunk_reject++;
+      }
+    }
+
+    $pm->finish(0, {
+      validated => \@chunk_validated,
+      strict    => $chunk_strict,
+      degen     => $chunk_degen,
+      rejected  => $chunk_reject
+    });
+  }
+
+  $pm->wait_all_children();
+  @validatedPrimers = sort { $a->location() <=> $b->location() || $a->length() <=> $b->length() } @validatedPrimers;
 
   _finish_progress($rev_progress);
   print "  [NativeReverse] Resultats / Results:\n";
@@ -795,7 +1050,7 @@ sub reduceSignaturesByOverlap
   }
 
   my $signatureCount= scalar(@{$signatures_r});
-  print " Reducing signatures ha $signatureCount->";
+  print " Reducing signatures ( $signatureCount->";
   
   # Short-cut if we're at 100% overlap
   if($maxOverlapPercent == 100)
@@ -1304,7 +1559,7 @@ sub analyzeSignatureCombinations {
       push @combination_results, {
         signatures => \@combination,
         signature_names => \@signature_names,
-        union_sequences => [keys %union_sequences],
+        union_sequences => [sort keys %union_sequences],
         union_count => $union_count,
         union_coverage => $union_coverage
       };
@@ -1333,43 +1588,7 @@ sub analyzeSignatureCombinations {
 
 #-------------------------------------------------------------------------------
 
-=head2 calculateDynamicPairLengths
 
-  Calcule dynamiquement les longueurs cibles des paires Middle et Inner
-  a partir des contraintes de distance maximale entre niveaux de primers.
-  Dynamically computes target pair lengths from max distance constraints.
-
-  Parametres / Parameters:
-    outer_pair_target  - Longueur cible de la paire Outer
-    max_dist_outer_middle - Distance max F3-F2
-    max_dist_middle_inner - Distance max F2-F1
-    min_inner_pair_spacing - Espacement minimum F1-B1
-
-  Retourne / Returns: ($middlePairTarget, $innerPairTarget)
-
-=cut
-
-sub calculateDynamicPairLengths {
-  my ($outer_pair_target, $max_dist_outer_middle, $max_dist_middle_inner, $min_inner_pair_spacing) = @_;
-  
-  print "\nINFO: Calcul dynamique des longueurs cibles active.\n";
-  print "INFO: Dynamic target length calculation activated.\n";
-  
-  my $middle_pair_target = $outer_pair_target - (2 * $max_dist_outer_middle);
-  print "  -> Cible Middle Pair calculee : $middle_pair_target nt (distance max: $max_dist_outer_middle nt)\n";
-  
-  my $inner_pair_target = $middle_pair_target - (2 * $max_dist_middle_inner);
-  print "  -> Cible Inner Pair calculee : $inner_pair_target nt (distance max: $max_dist_middle_inner nt)\n";
-  
-  if ($inner_pair_target < $min_inner_pair_spacing) {
-    die "ERREUR: La cible Inner Pair ($inner_pair_target nt) < distance minimale F1-B1 ($min_inner_pair_spacing nt).\n" .
-        "ERROR: Inner Pair target ($inner_pair_target nt) < minimum F1-B1 spacing ($min_inner_pair_spacing nt).\n" .
-        "Veuillez ajuster vos contraintes de distance.\n";
-  }
-  print "--------------------------------------------------\n\n";
-  
-  return ($middle_pair_target, $inner_pair_target);
-}
 
 #-------------------------------------------------------------------------------
 
@@ -1390,16 +1609,30 @@ sub calculateDynamicPairLengths {
 
 =cut
 
+sub _build_bit_vector {
+    my ($ids_ref) = @_;
+    my $vec = "";
+    foreach my $id (@$ids_ref) {
+        vec($vec, $id, 1) = 1;
+    }
+    return $vec;
+}
+
 sub calculateSignatureIntersection {
-  my ($signature, $total_sequences, $min_signature_coverage, $include_extra_primers, $extra_primer_type) = @_;
+  my ($signature, $total_sequences, $min_signature_coverage, $include_extra_primers, $extra_primer_type, $verbose, $verbose_fh, $return_list) = @_;
   
+  $return_list = 1 unless defined $return_list;
   # Valeurs par defaut / Default values
   $min_signature_coverage = 70 unless defined $min_signature_coverage;
   $extra_primer_type = "" unless defined $extra_primer_type;
+  $verbose = 0 unless defined $verbose;
   
   my $type_label = uc($extra_primer_type) || "CLASSIC";
   my $mode_text = $include_extra_primers ? "LAMP+$type_label" : "LAMP classique (6 primers)";
-  print "\n  VALIDATION DE SIGNATURE $mode_text (seuil: ${min_signature_coverage}%)\n";
+  
+  if ($verbose && defined $verbose_fh) {
+    print $verbose_fh "\n  VALIDATION DE SIGNATURE $mode_text (seuil: ${min_signature_coverage}%)\n";
+  }
   
   # Primers principaux : F3/B3 (outer), F2/B2 (middle), F1/B1 (inner)
   my @all_primers = ();
@@ -1433,9 +1666,10 @@ sub calculateSignatureIntersection {
       # Creer le tag par defaut si absent / Create default tag if missing
       eval { $f_primer->getTag("compatible_sequence_ids"); };
       if ($@) {
-        print "   [FIX] $F_label sans tag compatible_sequence_ids - creation par defaut\n";
+        print $verbose_fh "   [FIX] $F_label sans tag compatible_sequence_ids - creation par defaut\n" if $verbose && defined $verbose_fh;
         my @all_seq_ids = (0 .. $total_sequences - 1);
         $f_primer->setTag("compatible_sequence_ids", \@all_seq_ids);
+        $f_primer->setTag("compatible_sequence_vec", _build_bit_vector(\@all_seq_ids));
       }
       push @all_primers, $f_primer;
       push @primer_names, $F_label;
@@ -1447,22 +1681,27 @@ sub calculateSignatureIntersection {
       my $b_primer = $b_info->getAnalyzedPrimer();
       eval { $b_primer->getTag("compatible_sequence_ids"); };
       if ($@) {
-        print "   [FIX] $B_label sans tag compatible_sequence_ids - creation par defaut\n";
+        print $verbose_fh "   [FIX] $B_label sans tag compatible_sequence_ids - creation par defaut\n" if $verbose && defined $verbose_fh;
         my @all_seq_ids = (0 .. $total_sequences - 1);
         $b_primer->setTag("compatible_sequence_ids", \@all_seq_ids);
+        $b_primer->setTag("compatible_sequence_vec", _build_bit_vector(\@all_seq_ids));
       }
       push @all_primers, $b_primer;
       push @primer_names, $B_label;
     }
     
-    if (!defined $f_info && !defined $b_info) {
-      print "   [WARN] $type_label primers demandes mais non trouves dans la signature\n";
-    } else {
-      print "   $type_label primers ajoutes a l'analyse\n";
+    if ($verbose && defined $verbose_fh) {
+      if (!defined $f_info && !defined $b_info) {
+        print $verbose_fh "   [WARN] $type_label primers demandes mais non trouves dans la signature\n";
+      } else {
+        print $verbose_fh "   $type_label primers ajoutes a l'analyse\n";
+      }
     }
   }
   
-  print "   Primers a analyser: " . scalar(@all_primers) . " (" . join(", ", @primer_names) . ")\n";
+  if ($verbose && defined $verbose_fh) {
+    print $verbose_fh "   Primers a analyser: " . scalar(@all_primers) . " (" . join(", ", @primer_names) . ")\n";
+  }
   return ([], 0.0, "Aucun primer disponible") if @all_primers == 0;
   
   # Phase 1: Verifier les sequences compatibles de chaque primer
@@ -1475,61 +1714,73 @@ sub calculateSignatureIntersection {
     my $compatible_sequences_ref;
     eval { $compatible_sequences_ref = $primer->getTag("compatible_sequence_ids"); };
     
-    if ($@ || !defined $compatible_sequences_ref) {
-      print "   [FAIL] $primer_name: PAS de tag 'compatible_sequence_ids'\n";
-      return ([], 0.0, "Primer $primer_name sans sequences compatibles");
+    if ($@ || !defined $compatible_sequences_ref || @$compatible_sequences_ref == 0) {
+      print $verbose_fh "   [FAIL] $primer_name: PAS de tag 'compatible_sequence_ids'\n" if $verbose && defined $verbose_fh;
+      return ([], 0.0, "Echec: pas de sequences compatibles pour $primer_name");
     }
     
-    my $count = scalar(@{$compatible_sequences_ref});
+    my $compatible_sequences_vec;
+    eval { $compatible_sequences_vec = $primer->getTag("compatible_sequence_vec"); };
+    if (!defined $compatible_sequences_vec) {
+      $compatible_sequences_vec = _build_bit_vector($compatible_sequences_ref);
+      $primer->setTag("compatible_sequence_vec", $compatible_sequences_vec);
+    }
+    
+    my $count = scalar(@$compatible_sequences_ref);
     my $pct = ($total_sequences > 0) ? ($count / $total_sequences) * 100 : 0.0;
-    print "   [OK] $primer_name: $count sequences compatibles (${pct}%)\n";
     
     push @primer_coverage_data, {
-      name => $primer_name, sequences => $compatible_sequences_ref,
+      name => $primer_name, sequences => $compatible_sequences_ref, vec => $compatible_sequences_vec,
       count => $count, percent => $pct
     };
   }
   
-  # Phase 2: Intersection successive / Successive intersection
-  print "\n  CALCUL DE L'INTERSECTION:\n";
-  my %intersection_set = map { $_ => 1 } @{$primer_coverage_data[0]->{sequences}};
+  # Phase 2: Intersection successive (Optimisation par vecteur de bits)
+  print $verbose_fh "\n  CALCUL DE L'INTERSECTION:\n" if $verbose && defined $verbose_fh;
+  my $intersection_vec = $primer_coverage_data[0]->{vec};
   
   for my $i (1 .. $#primer_coverage_data) {
-    my %primer_set = map { $_ => 1 } @{$primer_coverage_data[$i]->{sequences}};
-    my %new_intersection = ();
-    for my $seq_id (keys %intersection_set) {
-      $new_intersection{$seq_id} = 1 if exists $primer_set{$seq_id};
-    }
-    %intersection_set = %new_intersection;
-    last if scalar(keys %intersection_set) == 0;
+    $intersection_vec = $intersection_vec & $primer_coverage_data[$i]->{vec};
+    last if unpack("%32b*", $intersection_vec) == 0;
   }
   
   # Phase 3: Validation finale / Final validation
-  my @final_ids = keys %intersection_set;
-  my $coverage_count = scalar(@final_ids);
+  my $coverage_count = unpack("%32b*", $intersection_vec);
   my $coverage_pct = ($total_sequences > 0) ? ($coverage_count / $total_sequences) * 100 : 0.0;
   
-  print "\n  RESULTAT FINAL:\n";
-  print "   Sequences amplifiees par TOUTES les amorces: $coverage_count/$total_sequences\n";
-  printf "   Pourcentage de couverture: %.2f%%\n", $coverage_pct;
+  if ($verbose && defined $verbose_fh) {
+    print $verbose_fh "\n  RESULTAT FINAL:\n";
+    print $verbose_fh "   Sequences amplifiees par TOUTES les amorces: $coverage_count/$total_sequences\n";
+    printf $verbose_fh ("   Pourcentage de couverture: %.2f%%\n", $coverage_pct);
+  }
   
   my $validation_status;
   if ($coverage_pct >= $min_signature_coverage) {
-    print "   [PASS] SIGNATURE VALIDEE (${coverage_pct}% >= ${min_signature_coverage}%)\n";
+    print $verbose_fh "   [PASS] SIGNATURE VALIDEE (${coverage_pct}% >= ${min_signature_coverage}%)\n" if $verbose && defined $verbose_fh;
     $validation_status = "VALIDEE";
   } else {
-    print "   [FAIL] SIGNATURE REJETEE (${coverage_pct}% < ${min_signature_coverage}%)\n";
+    print $verbose_fh "   [FAIL] SIGNATURE REJETEE (${coverage_pct}% < ${min_signature_coverage}%)\n" if $verbose && defined $verbose_fh;
     $validation_status = "REJETEE - Couverture insuffisante";
   }
   
-  # Stocker les tags de validation / Store validation tags
-  $signature->setTag("signature_intersection_ids", \@final_ids);
-  $signature->setTag("signature_coverage_percent", sprintf("%.2f", $coverage_pct));
-  $signature->setTag("signature_target_count", $coverage_count);
-  $signature->setTag("validation_status", $validation_status);
-  $signature->setTag("primer_coverage_details", \@primer_coverage_data);
-  
-  return (\@final_ids, $coverage_pct, $validation_status);
+  if ($return_list) {
+      my @final_ids = ();
+      for (my $id = 0; $id < $total_sequences; $id++) {
+          push @final_ids, $id if vec($intersection_vec, $id, 1);
+      }
+      
+      # Stocker les tags de validation / Store validation tags
+      $signature->setTag("signature_intersection_ids", \@final_ids);
+      $signature->setTag("signature_coverage_percent", sprintf("%.2f", $coverage_pct));
+      $signature->setTag("signature_target_count", $coverage_count);
+      $signature->setTag("validation_status", $validation_status);
+      $signature->setTag("primer_coverage_details", \@primer_coverage_data);
+      
+      return (\@final_ids, $coverage_pct, $validation_status);
+  } else {
+      # Return count instead of array reference
+      return ($coverage_count, $coverage_pct, $validation_status);
+  }
 }
 
 #-------------------------------------------------------------------------------
@@ -1697,7 +1948,7 @@ sub createAmplificationFiles {
     }
   }
   
-  my @amplified_ids = keys %all_amplified_ids;
+  my @amplified_ids = sort keys %all_amplified_ids;
   my @excluded_ids = ();
   for my $i (0 .. $#{$sequence_objects_ref}) {
     push @excluded_ids, $i unless exists $all_amplified_ids{$i};
@@ -1748,6 +1999,624 @@ sub createAmplificationFiles {
   return ($amplified_file, $excluded_file);
 }
 
+#-------------------------------------------------------------------------------
+
+=head2 findPrimerPositionInAlignment
+
+  Cherche la position 0-indexee d une sequence d amorce dans un MSA BioPerl.
+  Searches for the 0-indexed position of a primer sequence in a BioPerl MSA.
+
+  Strategie / Strategy:
+    1. Essai a la position optionnelle fournie (substring exact).
+       Try at the optional supplied position (exact substring).
+    2. Si non trouve (ou position non fournie), scan complet de chaque sequence du MSA.
+       If not found (or no position given), full scan of each MSA sequence.
+    3. Essai egalement avec le reverse-complement de la sequence.
+       Also tries the reverse complement of the sequence.
+
+  Retourne / Returns:
+    ($position, $strand) ou (undef, undef) si introuvable.
+    ($position, $strand) or (undef, undef) if not found.
+    $strand = "plus" ou "minus" (RC).
+
+=cut
+
+sub findPrimerPositionInAlignment {
+  my ($alignment, $primer_seq, $hint_position) = @_;
+
+  my $primer_uc  = uc($primer_seq);
+  my $primer_rc  = uc(rev_comp($primer_seq));
+
+  # Helper pour convertir une chaine IUPAC en regex / Helper to convert IUPAC string to regex
+  my $iupac_to_regex = sub {
+    my $seq = shift;
+    $seq =~ s/R/[AG]/g;
+    $seq =~ s/Y/[CT]/g;
+    $seq =~ s/S/[CG]/g;
+    $seq =~ s/W/[AT]/g;
+    $seq =~ s/K/[GT]/g;
+    $seq =~ s/M/[AC]/g;
+    $seq =~ s/B/[CGT]/g;
+    $seq =~ s/D/[AGT]/g;
+    $seq =~ s/H/[ACT]/g;
+    $seq =~ s/V/[ACG]/g;
+    $seq =~ s/N/[ACGT]/g;
+    return qr/$seq/;
+  };
+
+  my $regex_plus  = $iupac_to_regex->($primer_uc);
+  my $regex_minus = $iupac_to_regex->($primer_rc);
+
+  # Fonction interne de recherche dans une sequence alignee (avec et sans gaps)
+  # Internal helper: search in an aligned sequence (with and without gaps)
+  my $scan_seq = sub {
+    my ($aln_seq_raw) = @_;
+    my $aln_seq_uc = uc($aln_seq_raw);
+
+    # Recherche directe (brin plus) / Direct search (plus strand)
+    if ($aln_seq_uc =~ /$regex_plus/) {
+      return ($-[0], "plus");
+    }
+
+    # Recherche du reverse complement (brin moins) / Reverse complement search (minus strand)
+    if ($aln_seq_uc =~ /$regex_minus/) {
+      return ($-[0], "minus");
+    }
+
+    return (undef, undef);
+  };
+
+  # --- Etape 1 : essai a la position fournie ---
+  # --- Step 1: try at the supplied hint position ---
+  if (defined $hint_position) {
+    foreach my $seq ($alignment->each_seq()) {
+      my $aln_str = uc($seq->seq());
+      my $len     = length($primer_uc);
+
+      if ($hint_position + $len <= length($aln_str)) {
+        my $region = substr($aln_str, $hint_position, $len);
+        if ($region =~ /^$regex_plus$/) {
+          print "[FIXED PRIMER] Sequence trouvee a la position fournie $hint_position (brin +).\n";
+          print "[FIXED PRIMER] Sequence found at supplied position $hint_position (+ strand).\n";
+          return ($hint_position, "plus");
+        }
+        if ($region =~ /^$regex_minus$/) {
+          print "[FIXED PRIMER] Sequence RC trouvee a la position fournie $hint_position (brin -).\n";
+          print "[FIXED PRIMER] RC sequence found at supplied position $hint_position (- strand).\n";
+          return ($hint_position, "minus");
+        }
+      }
+    }
+    print "[FIXED PRIMER] AVERTISSEMENT: Sequence non trouvee a la position fournie $hint_position. Lancement du scan complet...\n";
+    print "[FIXED PRIMER] WARNING: Sequence not found at supplied position $hint_position. Starting full scan...\n";
+  }
+
+  # --- Etape 2 : scan complet de toutes les sequences ---
+  # --- Step 2: full scan of all sequences ---
+  foreach my $seq ($alignment->each_seq()) {
+    my ($found_pos, $found_strand) = $scan_seq->($seq->seq());
+    if (defined $found_pos) {
+      print "[FIXED PRIMER] Sequence trouvee par scan complet a la position $found_pos (brin $found_strand).\n";
+      print "[FIXED PRIMER] Sequence found by full scan at position $found_pos (strand $found_strand).\n";
+      return ($found_pos, $found_strand);
+    }
+  }
+
+  print "[FIXED PRIMER] ERREUR: Sequence '$primer_seq' introuvable dans l'alignement.\n";
+  print "[FIXED PRIMER] ERROR: Sequence '$primer_seq' not found in the alignment.\n";
+  return (undef, undef);
+}
+
+#-------------------------------------------------------------------------------
+
+=head2 getPrimer3ParamsForType
+
+  Construit le hash unifie des parametres Primer3 pour un type d amorce donne.
+  Builds the unified Primer3 parameter hash for a given primer type.
+
+=cut
+
+sub getPrimer3ParamsForType {
+  my ($primer_type, $options_r) = @_;
+  $options_r //= {};
+
+  my $type_uc = uc($primer_type // "INNER");
+  my $pfx = "inner_primer";
+  if ($type_uc =~ /^F3|B3$/) {
+    $pfx = "outer_primer";
+  } elsif ($type_uc =~ /^F2|B2$/) {
+    $pfx = "middle_primer";
+  } elsif ($type_uc =~ /^F1C?|B1C?$/) {
+    $pfx = "inner_primer";
+  } elsif ($type_uc =~ /^FLOOP|BLOOP$/) {
+    $pfx = "loop_primer";
+  } elsif ($type_uc =~ /^FSTEM|BSTEM$/) {
+    $pfx = "stem_primer";
+  }
+
+  my $target_len = $options_r->{$pfx . "_target_length"} // $options_r->{$pfx . "_length"} // ($pfx eq "inner_primer" ? 23 : 20);
+  my $min_len    = $options_r->{$pfx . "_min_length"}    // ($pfx eq "inner_primer" ? 20 : 18);
+  my $max_len    = $options_r->{$pfx . "_max_length"}    // ($pfx eq "inner_primer" ? 26 : 27);
+
+  my $target_tm  = $options_r->{$pfx . "_target_tm"}     // $options_r->{$pfx . "_tm"} // ($pfx eq "inner_primer" ? 62.0 : 60.0);
+  my $min_tm     = $options_r->{$pfx . "_min_tm"}        // ($target_tm - 1.0);
+  my $max_tm     = $options_r->{$pfx . "_max_tm"}        // ($target_tm + 1.0);
+
+  my $max_poly_x = $options_r->{"max_poly_bases"} // 2;
+  my $min_gc     = $options_r->{"min_gc"} // 30;
+  my $max_gc     = $options_r->{"max_gc"} // 80;
+
+  my $dna_conc   = $options_r->{"dna_conc"} // 400.0;
+  my $dntp_conc  = $options_r->{"dntp_conc"} // 1.4;
+  my $salt_mono  = $options_r->{"salt_conc"} // $options_r->{"salt_monovalent"} // 50.0;
+  my $salt_div   = $options_r->{"mg_conc"}   // $options_r->{"salt_divalent"}   // 8.0;
+
+  my $tm_formula = $options_r->{"primer3_tm_formula"} // 1;
+  my $salt_corr  = $options_r->{"primer3_salt_corrections"} // 2;
+
+  my %args = (
+    'PRIMER_INTERNAL_OPT_SIZE'         => int($target_len),
+    'PRIMER_INTERNAL_MIN_SIZE'         => int($min_len),
+    'PRIMER_INTERNAL_MAX_SIZE'         => int($max_len),
+    'PRIMER_INTERNAL_OPT_TM'           => sprintf("%.2f", $target_tm) + 0,
+    'PRIMER_INTERNAL_MIN_TM'           => sprintf("%.2f", $min_tm) + 0,
+    'PRIMER_INTERNAL_MAX_TM'           => sprintf("%.2f", $max_tm) + 0,
+    'PRIMER_INTERNAL_OLIGO_MAX_POLY_X' => int($max_poly_x),
+    'PRIMER_INTERNAL_MIN_GC'           => sprintf("%.2f", $min_gc) + 0,
+    'PRIMER_INTERNAL_MAX_GC'           => sprintf("%.2f", $max_gc) + 0,
+    'PRIMER_INTERNAL_DNA_CONC'         => sprintf("%.2f", $dna_conc) + 0,
+    'PRIMER_INTERNAL_DNTP_CONC'        => sprintf("%.2f", $dntp_conc) + 0,
+    'PRIMER_INTERNAL_SALT_MONOVALENT'  => sprintf("%.2f", $salt_mono) + 0,
+    'PRIMER_INTERNAL_SALT_DIVALENT'    => sprintf("%.2f", $salt_div) + 0,
+    'PRIMER_INTERNAL_OLIGO_SELF_ANY'   => 8.00,
+    'PRIMER_TM_FORMULA'                => int($tm_formula),
+    'PRIMER_SALT_CORRECTIONS'          => int($salt_corr),
+    'PRIMER_THERMODYNAMIC_ALIGNMENT'   => 1,
+  );
+
+  my $thermo_path = $options_r->{"thermodynamic_path"};
+  if (defined $thermo_path && $thermo_path ne "" && $thermo_path ne "/etc/primer3_config/") {
+    $args{'PRIMER_THERMODYNAMIC_PARAMETERS_PATH'} = $thermo_path;
+  }
+
+  return %args;
+}
+
+#-------------------------------------------------------------------------------
+
+=head2 injectFixedPrimers
+
+  Injecte des amorces fixees par l utilisateur dans le pipeline LAVA.
+  Injects user-fixed primers into the LAVA pipeline.
+
+  Chaque amorce fixee :
+    1. Passe par checkPrimerMismatchTolerance (Branch and Bound IUPAC) pour tenter
+       d ameliorer son rendement en couverture.
+    2. Est TOUJOURS incluse dans le pool retourne, meme si la couverture est sous le seuil
+       (tag coverage_forced = 1).
+
+  Each fixed primer:
+    1. Goes through checkPrimerMismatchTolerance (Branch and Bound IUPAC) to try
+       to improve its coverage yield.
+    2. Is ALWAYS included in the returned pool, even if coverage is below threshold
+       (tag coverage_forced = 1).
+
+  Arguments:
+    $alignment          - MSA BioPerl (Bio::SimpleAlign)
+    $fixed_specs_ref    - Arrayref de hashrefs { type, seq, pos }
+                          Arrayref of hashrefs { type, seq, pos }
+    $min_match_percent, $min_iupac_percent, $min_primer_coverage
+    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen
+    $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency
+
+  Returns:
+    Une hashref { "F2" => [$oligo1, ...], "B3" => [...], ... }
+    A hashref    { "F2" => [$oligo1, ...], "B3" => [...], ... }
+
+=cut
+
+sub injectFixedPrimers {
+  my ($alignment, $fixed_specs_ref,
+      $min_match_percent, $min_iupac_percent, $min_primer_coverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen,
+      $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      $fixed_primer_optimize,
+      $target_tms_ref,
+      $options_r) = @_;
+      
+  $fixed_primer_optimize //= 1; # Par defaut, on optimise
+
+  my %result;  # { "F2" => [@oligos], ... }
+
+  return \%result unless defined $fixed_specs_ref && @{$fixed_specs_ref};
+
+  my $calc_tm = sub {
+      my ($seq, $type) = @_;
+      my %IUPAC = (
+          'A' => ['A'], 'C' => ['C'], 'G' => ['G'], 'T' => ['T'], 'U' => ['T'],
+          'R' => ['A', 'G'], 'Y' => ['C', 'T'], 'S' => ['G', 'C'], 'W' => ['A', 'T'],
+          'K' => ['G', 'T'], 'M' => ['A', 'C'], 'B' => ['C', 'G', 'T'], 'D' => ['A', 'G', 'T'],
+          'H' => ['A', 'C', 'T'], 'V' => ['A', 'C', 'G'], 'N' => ['A', 'C', 'G', 'T']
+      );
+      my @seqs = ('');
+      for my $char (split //, uc($seq)) {
+          my $bases = $IUPAC{$char} || [$char];
+          my @new_seqs;
+          for my $s (@seqs) {
+              for my $b (@$bases) { push @new_seqs, $s . $b; }
+          }
+          @seqs = @new_seqs;
+      }
+      my $sum = 0; my $count = 0;
+      my $cmd = "oligotm -mv 50 -dv 8 -n 1.4 -d 400 -tp 1 -sc 1";
+      for my $s (@seqs) {
+          my $tm = `$cmd $s 2>/dev/null`;
+          chomp($tm);
+          if ($tm =~ /^([\d\.]+)$/) { $sum += $1; $count++; }
+      }
+      if ($count > 0) { return $sum / $count; }
+      print "[FIXED PRIMER] WARNING: oligotm echoue ou introuvable. Utilisation d'un Tm par defaut.\n";
+      return ($type =~ /^F1C|B1C$/i) ? 62.0 : 60.0;
+  };
+  
+  my $expand_sequence = sub {
+      my ($seq) = @_;
+      my %IUPAC = (
+          'A' => ['A'], 'C' => ['C'], 'G' => ['G'], 'T' => ['T'], 'U' => ['T'],
+          'R' => ['A', 'G'], 'Y' => ['C', 'T'], 'S' => ['G', 'C'], 'W' => ['A', 'T'],
+          'K' => ['G', 'T'], 'M' => ['A', 'C'], 'B' => ['C', 'G', 'T'], 'D' => ['A', 'G', 'T'],
+          'H' => ['A', 'C', 'T'], 'V' => ['A', 'C', 'G'], 'N' => ['A', 'C', 'G', 'T']
+      );
+      my @results = ("");
+      foreach my $base (split //, uc($seq)) {
+          my @new_results;
+          my $choices = $IUPAC{$base} || [$base];
+          foreach my $prefix (@results) {
+              foreach my $choice (@$choices) {
+                  push @new_results, $prefix . $choice;
+              }
+          }
+          @results = @new_results;
+      }
+      return @results;
+  };
+
+  # Extraire les sequences de l alignement pour la validation
+  # Extract alignment sequences for validation
+  my @sequences = ();
+  foreach my $seq ($alignment->each_seq()) {
+    my $s = uc($seq->seq());
+    $s =~ s/[^ATCG]/N/g;
+    push @sequences, $s;
+  }
+
+  foreach my $spec (@{$fixed_specs_ref}) {
+    my $primer_type  = uc($spec->{type}  // "UNKNOWN");
+    my $primer_seq   = uc($spec->{seq}   // "");
+    my $hint_pos     = $spec->{pos};  # peut etre undef / can be undef
+
+    if (!$primer_seq) {
+      print "[FIXED PRIMER] ERREUR: Sequence vide pour le type $primer_type. Ignore.\n";
+      print "[FIXED PRIMER] ERROR: Empty sequence for type $primer_type. Skipped.\n";
+      next;
+    }
+
+    print "\n[FIXED PRIMER] Traitement de l'amorce fixee : TYPE=$primer_type SEQ=$primer_seq\n";
+    print "[FIXED PRIMER] Processing fixed primer: TYPE=$primer_type SEQ=$primer_seq\n";
+
+    # --- Etape 1 : localisation dans l alignement ---
+    # --- Step 1: locate in the alignment ---
+    my ($position, $strand) = findPrimerPositionInAlignment($alignment, $primer_seq, $hint_pos);
+
+    if (!defined $position) {
+      print "[FIXED PRIMER] AVERTISSEMENT: Impossible de localiser '$primer_seq'. Injection a la position 0 par defaut.\n";
+      print "[FIXED PRIMER] WARNING: Cannot locate '$primer_seq'. Injecting at position 0 by default.\n";
+      $position = 0;
+      $strand   = "plus";
+    }
+
+    # --- Etape 2 : Branch and Bound IUPAC (meme circuit que les amorces normales) ---
+    # --- Step 2: Branch and Bound IUPAC (same circuit as normal primers) ---
+    print "[FIXED PRIMER] Validation de l'amorce et calcul de couverture...\n";
+    print "[FIXED PRIMER] Validating primer and calculating coverage...\n";
+
+    my ($final_sequence, $coverage_percent, $is_degenerate, $compatible_seq_ids) =
+      checkPrimerMismatchTolerance(
+        \@sequences, $position, length($primer_seq), $primer_seq,
+        $min_match_percent, $min_iupac_percent, $min_primer_coverage,
+        $maxTotalDegen, $maxConsecDegen,
+        $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency
+      );
+
+    # Si B&B n a pas ameliore (retour de chaine vide), conserver la sequence originale
+    # If B&B did not improve (empty string returned), keep the original sequence
+    $final_sequence   = $primer_seq     if !defined $final_sequence || $final_sequence eq "";
+    $compatible_seq_ids //= [];
+    $coverage_percent //= 0.0;
+
+    # Chantier 2: Application de l'option fixed_primer_optimize
+    if (!$fixed_primer_optimize) {
+        $final_sequence = $primer_seq;
+        print "[FIXED PRIMER] Mode sans optimisation : sequence conservee telle quelle, couverture mesuree = $coverage_percent% (".scalar(@$compatible_seq_ids)." sequences).\n";
+    } else {
+        print "[FIXED PRIMER] Mode optimisation (Branch and Bound IUPAC) : sequence $final_sequence, couverture mesuree = $coverage_percent% (".scalar(@$compatible_seq_ids)." sequences).\n";
+    }
+
+    my $coverage_forced = ($coverage_percent < $min_primer_coverage) ? 1 : 0;
+
+    if ($coverage_forced) {
+      printf("[FIXED PRIMER] Couverture apres B&B : %.1f%% < seuil %.1f%% -> INCLUSION FORCEE (amorce fixee).\n",
+             $coverage_percent, $min_primer_coverage);
+      printf("[FIXED PRIMER] Coverage after B&B: %.1f%% < threshold %.1f%% -> FORCED INCLUSION (fixed primer).\n",
+             $coverage_percent, $min_primer_coverage);
+    } else {
+      printf("[FIXED PRIMER] Couverture apres B&B : %.1f%% >= seuil %.1f%% -> ACCEPTEE normalement.\n",
+             $coverage_percent, $min_primer_coverage);
+      printf("[FIXED PRIMER] Coverage after B&B: %.1f%% >= threshold %.1f%% -> ACCEPTED normally.\n",
+             $coverage_percent, $min_primer_coverage);
+    }
+
+    # --- Etape 3 : creation de l objet Oligo compatible avec le reste du pipeline ---
+    # --- Step 3: create an Oligo object compatible with the rest of the pipeline ---
+    # Conformite stricte LAVA (2026) :
+    # Si le brin est minus, la convention du moteur LAVA attend l'extremite DROITE 
+    # de l'amorce sur l'alignement de reference (voir buildNativeReversePool l.588)
+    my $final_location = ($strand eq "minus") ? ($position + length($primer_seq) - 1) : $position;
+    
+    my $fixed_oligo = LLNL::LAVA::Oligo->new({
+      "sequence" => $final_sequence,
+      "location" => $final_location,
+      "strand"   => $strand,
+    });
+
+    # Tags obligatoires pour la compatibilite avec le pipeline
+    # Mandatory tags for pipeline compatibility
+    $fixed_oligo->setTag("is_degenerate",         $is_degenerate ? 1 : 0);
+    $fixed_oligo->setTag("iupac_coverage",         sprintf("%.1f", $coverage_percent));
+    $fixed_oligo->setTag("compatible_sequence_ids", $compatible_seq_ids);
+    $fixed_oligo->setTag("compatible_sequence_vec", _build_bit_vector($compatible_seq_ids));
+    $fixed_oligo->setTag("original_sequence",      $primer_seq);
+
+    # Tags specific to fixed primers
+    $fixed_oligo->setTag("is_fixed",               1);
+    $fixed_oligo->setTag("fixed_type",             $primer_type);
+    $fixed_oligo->setTag("coverage_forced",        $coverage_forced);
+    $fixed_oligo->setTag("fixed_original_seq",     $primer_seq);
+    
+    # Calcul de la pénalité via Primer3 pour permettre une comparaison équitable
+    my $target_tm = (defined $target_tms_ref && defined $target_tms_ref->{$primer_type}) ? $target_tms_ref->{$primer_type} : 60.0;
+    my $real_tm = 0;
+    my $tm_penalty = 0;
+    my $scoring_method = "REPLI : options non fournies";
+
+    if (defined $options_r) {
+        require Bio::Tools::Run::Primer3;
+        
+        # Factorisation unifiée des paramètres Primer3 par type d'amorce (Cause 1)
+        my %primer3_args = getPrimer3ParamsForType($primer_type, $options_r);
+        
+        # Propriétés spécifiques au scoring check_primers
+        $primer3_args{'PRIMER_TASK'}                = 'check_primers';
+        $primer3_args{'PRIMER_PICK_INTERNAL_OLIGO'} = 1;
+        $primer3_args{'PRIMER_PICK_ANYWAY'}         = 1;
+        $primer3_args{'SEQUENCE_ID'}                = 't';
+
+        # Control strict anti-rejet silencieux BioPerl
+        my %p3_valid_params = map { $_ => 1 } @Bio::Tools::Run::Primer3::PRIMER3_PARAMS;
+        foreach my $k (sort keys %primer3_args) {
+            die "\n[ERREUR CRITIQUE LAVA] Le parametre Primer3 '$k' est absent de \@Bio::Tools::Run::Primer3::PRIMER3_PARAMS.\n" 
+                unless exists $p3_valid_params{$k};
+        }
+
+        # Sequence de reference pour la substitution synthetique (Cause 2)
+        my $first_seq = $alignment->get_seq_by_pos(1);
+        my $ref_seq_str = uc($first_seq->seq());
+        $ref_seq_str =~ s/\-/N/g; # Primer3 ne tolère pas les gaps (-)
+        
+        my @variants = $expand_sequence->($final_sequence);
+        my $sum_tm = 0;
+        my $sum_pen = 0;
+        my $valid_variants = 0;
+        my @variant_errors = ();
+
+        my $p3_exec = $options_r->{"primer3_executable"} // "/usr/bin/primer3_core";
+
+        foreach my $var_seq (@variants) {
+            # Template synthetique par substitution a la position connue (Cause 2)
+            # Primer3 cherche SEQUENCE_INTERNAL_OLIGO ($var_seq) directement sur SEQUENCE_TEMPLATE.
+            # On substitue donc $var_seq a la position $position pour garantir sa presence.
+            my $synthetic_template = $ref_seq_str;
+            my $var_len = length($var_seq);
+            if ($position + $var_len <= length($synthetic_template)) {
+                substr($synthetic_template, $position, $var_len) = $var_seq;
+            }
+
+            $primer3_args{'SEQUENCE_TEMPLATE'}      = $synthetic_template;
+            $primer3_args{'SEQUENCE_INTERNAL_OLIGO'} = $var_seq;
+            
+            my ($p3, $results);
+            my $eval_err = "";
+            eval {
+                $p3 = Bio::Tools::Run::Primer3->new(-path => $p3_exec);
+                $p3->add_targets(%primer3_args);
+                $p3->{'verbose'} = 0;
+                $results = $p3->run();
+            };
+            if ($@) {
+                $eval_err = $@;
+                chomp($eval_err);
+            }
+            
+            if (!$eval_err && $results && $results->number_of_results > 0) {
+                my $res = $results->primer_results(0);
+                my $pen = $res->{"PRIMER_INTERNAL_PENALTY"};
+                my $tm  = $res->{"PRIMER_INTERNAL_TM"};
+                my $p3_err = $res->{"PRIMER_ERROR"};
+                
+                if (defined $pen && defined $tm) {
+                    $sum_pen += $pen;
+                    $sum_tm  += $tm;
+                    $valid_variants++;
+                } else {
+                    my $msg = $p3_err ? "Primer3 a repondu \"$p3_err\"" : "Aucune penalite retournee";
+                    push @variant_errors, "$msg pour la variante $var_seq";
+                }
+            } else {
+                my $msg = $eval_err ? "Erreur execution ($eval_err)" : ($results ? "Aucun resultat" : "Erreur execution Primer3");
+                push @variant_errors, "$msg pour la variante $var_seq";
+            }
+        }
+        
+        if ($valid_variants > 0) {
+            # NOTE DU CONCEPTEUR / DESIGNER NOTE (FR/EN):
+            # Pour une amorce fixee degeneree, la penalite retenue est la MOYENNE des penalites
+            # de toutes les variantes IUPAC developpees.
+            # Justification : Un oligo degenere est un MELANGE physique de variantes synthetisees.
+            # L amorce degeneree n ayant pas de sequence non-degeneree d origine disponible
+            # (contrairement a une amorce generee par le Branch & Bound LAVA), la moyenne
+            # represente fidelement le comportement moyen du melange d oligos.
+            # Consequence : La penalite globale de la signature n est pas directement comparable
+            # a celle d un run libre, mais le classement relatif et le choix des amorces voisines
+            # restent rigoureusement inalteres (decalage constant sur le pool).
+            #
+            # For a degenerate fixed primer, the retained penalty is the AVERAGE of penalties
+            # across all expanded IUPAC variants.
+            # Justification: A degenerate oligo is a physical MIXTURE of synthesized variants.
+            # Since a fixed primer has no original non-degenerate sequence available (unlike a
+            # LAVA Branch & Bound generated primer), the average faithfully represents the
+            # mean physical behavior of the oligo mixture.
+            # Consequence: Overall signature penalty is not directly comparable to an unconstrained
+            # run, but relative ranking and neighbor selection remain strictly unaffected.
+            $tm_penalty = $sum_pen / $valid_variants;
+            $real_tm = $sum_tm / $valid_variants;
+            $scoring_method = "Primer3 check_primers";
+
+            if ($is_degenerate && scalar(@variants) > 1) {
+                printf("[FIXED PRIMER] TYPE=%s : %d variantes degenerees, penalite = moyenne de %d variantes (%.2f) - non comparable a un run sans amorce fixee.\n",
+                       $primer_type, scalar(@variants), $valid_variants, $tm_penalty);
+                printf("[FIXED PRIMER] TYPE=%s : %d degenerate variants, penalty = average of %d variants (%.2f) - not comparable to an unconstrained run.\n",
+                       $primer_type, scalar(@variants), $valid_variants, $tm_penalty);
+            }
+        } else {
+            my $cause = @variant_errors ? join("; ", @variant_errors[0..0]) : "Echec calcul Primer3";
+            $scoring_method = "REPLI : $cause";
+        }
+    }
+    
+    if ($scoring_method =~ /^REPLI/) {
+        $real_tm = $calc_tm->($final_sequence, $primer_type);
+        $tm_penalty = abs($real_tm - $target_tm);
+    }
+    
+    $fixed_oligo->setTag("primer3_tm", $real_tm);
+    $fixed_oligo->setTag("primer3_penalty", $tm_penalty);
+
+    printf("[FIXED PRIMER] TYPE=%s PEN=%.2f (%s)\n", $primer_type, $tm_penalty, $scoring_method);
+    printf("[FIXED PRIMER] Amorce injectee : TYPE=%s POS=%d STRAND=%s SEQ=%s COUV=%.1f%% FORCE=%d TM=%.1f PEN=%.2f\n",
+           $primer_type, $final_location, $strand, $final_sequence, $coverage_percent, $coverage_forced, $real_tm, $tm_penalty);
+    printf("[FIXED PRIMER] Primer injected : TYPE=%s POS=%d STRAND=%s SEQ=%s COVER=%.1f%% FORCED=%d TM=%.1f PEN=%.2f\n",
+           $primer_type, $final_location, $strand, $final_sequence, $coverage_percent, $coverage_forced, $real_tm, $tm_penalty);
+
+    $result{$primer_type} //= [];
+    push @{$result{$primer_type}}, $fixed_oligo;
+  }
+
+  return \%result;
+}
+
+#-------------------------------------------------------------------------------
+
+=head2 computeFixedPrimerWindows
+
+  Calcule la fenetre genomique valide pour chaque type d amorce LAMP en fonction
+  des amorces fixees par l utilisateur.
+  Computes the valid genomic window for each LAMP primer type based on user-fixed primers.
+
+  Principe / Principle:
+    Toute amorce fixee contraint geometriquement la position de toutes les autres.
+    Approche conservative : fenetre = [P - sig_max - margin, P + sig_max + margin]
+    intersection de toutes les contraintes des amorces fixees.
+    Les candidats hors-fenetre sont geometriquement impossibles meme avec la sigmoide.
+    Any fixed primer geometrically constrains all other primers.
+    Conservative approach: window = [P - sig_max - margin, P + sig_max + margin]
+    intersection of all fixed primer constraints.
+    Out-of-window candidates are geometrically impossible even with sigmoid penalty.
+
+  Arguments:
+    fixed_specs_ref - Arrayref de specs resolues { type, seq, pos (resolu) }
+    sig_max         - Longueur maximale de la signature (ex: 400 nt)
+    margin          - Marge de securite en nt (defaut: 200)
+    aln_length      - Longueur totale de l alignement
+
+  Returns:
+    Hashref { type => [min_pos, max_pos] } ou {} si aucune contrainte applicable.
+
+=cut
+
+sub computeFixedPrimerWindows {
+  my ($fixed_specs_ref, $sig_max, $margin, $aln_length) = @_;
+
+  $margin //= 200;
+  my %windows;
+
+  return {} unless defined $fixed_specs_ref && @{$fixed_specs_ref};
+
+  # Tous les types d amorces LAMP traites par les scripts / All LAMP primer types handled
+  my @all_types = qw(F3 F2 F1C B1C B2 B3 FLOOP BLOOP FSTEM BSTEM);
+
+  # Fenetre globale initiale = toute la longueur / Initial global window = full length
+  my $global_min = 0;
+  my $global_max = defined $aln_length ? $aln_length : 999_999;
+
+  my $window_width = $sig_max + $margin;
+  my $has_resolved = 0;
+
+  foreach my $spec (@{$fixed_specs_ref}) {
+    my $pos = $spec->{pos};
+    next unless defined $pos;  # position non resolue = pas de contrainte / unresolved = no constraint
+    $has_resolved = 1;
+
+    # Fenetre de la contrainte de cette amorce fixee
+    # Constraint window for this fixed primer
+    my $cmin = $pos - $window_width;
+    my $cmax = $pos + $window_width;
+    $cmin = 0              if $cmin < 0;
+    $cmax = $aln_length    if defined $aln_length && $cmax > $aln_length;
+
+    # Intersection avec la fenetre globale courante / Intersect with current global window
+    $global_min = $cmin if $cmin > $global_min;
+    $global_max = $cmax if $cmax < $global_max;
+
+    printf("[FIXED PRIMER WINDOW] Amorce %s@%d -> fenetre contrainte [%d, %d] (sig_max=%d + marge=%d)\n",
+           $spec->{type}, $pos, $cmin, $cmax, $sig_max, $margin);
+    printf("[FIXED PRIMER WINDOW] Primer %s@%d -> constraint window [%d, %d] (sig_max=%d + margin=%d)\n",
+           $spec->{type}, $pos, $cmin, $cmax, $sig_max, $margin);
+  }
+
+  return {} unless $has_resolved;
+
+  if ($global_min >= $global_max) {
+    print "[FIXED PRIMER WINDOW] AVERTISSEMENT: Fenetre globale invalide [$global_min, $global_max]. Contraintes incompatibles. Filtrage desactive.\n";
+    print "[FIXED PRIMER WINDOW] WARNING: Invalid global window [$global_min, $global_max]. Incompatible constraints. Filtering disabled.\n";
+    return {};
+  }
+
+  my $pct = (defined $aln_length && $aln_length > 0)
+              ? sprintf("%.1f%%", 100.0 * ($global_max - $global_min) / $aln_length)
+              : "N/A";
+  printf("[FIXED PRIMER WINDOW] Fenetre globale retenue : [%d, %d] (%s de l alignement)\n",
+         $global_min, $global_max, $pct);
+  printf("[FIXED PRIMER WINDOW] Global window retained  : [%d, %d] (%s of alignment)\n",
+         $global_min, $global_max, $pct);
+
+  # Appliquer la fenetre globale a tous les types / Apply global window to all types
+  foreach my $type (@all_types) {
+    $windows{$type} = [$global_min, $global_max];
+  }
+
+  return \%windows;
+}
+
 1;
 
 __END__
@@ -1761,4 +2630,3 @@ LAVA-DNA Fork (2026) - Code audit Phase 34-36
 L<LLNL::LAVA::Core>, L<LLNL::LAVA::Validator>
 
 =cut
-

@@ -65,9 +65,50 @@ use strict;
 use Time::HiRes qw(time);
 use warnings;
 use Carp;
+$| = 1;  # Autoflush STDOUT pour l'envoi en temps réel vers Flask
+use POSIX;
 use lib 'lib';
 
 use Getopt::Long;
+
+our $penalty_guard_innerToLoop_neg = 0;
+our $penalty_guard_innerToLoop_oob = 0;
+our $penalty_guard_loopToMiddle_neg = 0;
+our $penalty_guard_loopToMiddle_oob = 0;
+our $penalty_guard_innerToMiddle_neg = 0;
+our $penalty_guard_innerToMiddle_oob = 0;
+our $penalty_guard_middleToOuter_neg = 0;
+our $penalty_guard_middleToOuter_oob = 0;
+
+sub penaltyAt {
+    my ($table_r, $distance, $label) = @_;
+    if ($distance < 0) {
+        if ($label eq 'loopToMiddle') { $penalty_guard_loopToMiddle_neg++; }
+        elsif ($label eq 'innerToLoop') { $penalty_guard_innerToLoop_neg++; }
+        elsif ($label eq 'innerToMiddle') { $penalty_guard_innerToMiddle_neg++; }
+        elsif ($label eq 'middleToOuter') { $penalty_guard_middleToOuter_neg++; }
+        return 100;
+    }
+    if (!defined $table_r->[$distance]) {
+        if ($label eq 'loopToMiddle') { $penalty_guard_loopToMiddle_oob++; }
+        elsif ($label eq 'innerToLoop') { $penalty_guard_innerToLoop_oob++; }
+        elsif ($label eq 'innerToMiddle') { $penalty_guard_innerToMiddle_oob++; }
+        elsif ($label eq 'middleToOuter') { $penalty_guard_middleToOuter_oob++; }
+        return 100;
+    }
+    return $table_r->[$distance];
+}
+
+sub clamp_tm_target {
+    my ($target_ref, $min_val, $max_val, $param_prefix) = @_;
+    if ($$target_ref < $min_val) {
+        printf STDERR "AVERTISSEMENT : --%s_target_tm (%.1f) hors de la plage demandée [%.1f, %.1f]. Le Tm cible est ajusté à %.1f.\n", $param_prefix, $$target_ref, $min_val, $max_val, $min_val;
+        $$target_ref = $min_val;
+    } elsif ($$target_ref > $max_val) {
+        printf STDERR "AVERTISSEMENT : --%s_target_tm (%.1f) hors de la plage demandée [%.1f, %.1f]. Le Tm cible est ajusté à %.1f.\n", $param_prefix, $$target_ref, $min_val, $max_val, $max_val;
+        $$target_ref = $max_val;
+    }
+}
 
 
 use Bio::SimpleAlign;
@@ -90,7 +131,8 @@ use LLNL::LAVA::PrimerSetInfo::PCRPair;
 use LLNL::LAVA::PrimerSet::LAMP;
 use LLNL::LAVA::Core qw(generateDistancePenalties calculate_proportional_geometry generateSigmoidPenalty countDegenerateBases);
 use LLNL::LAVA::Validator qw(checkPrimerMismatchTolerance getPrimerTargetedSequences isIUPACCompatible rev_comp generateIUPACCode validateCompleteSignatureSpacing);
-use LLNL::LAVA::PipelineUtils qw(buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations calculateDynamicPairLengths); # buildReversePrimers retiré (DEPRECATED, remplacé par buildNativeReversePool)
+use LLNL::LAVA::PipelineUtils qw(getOligosWithMismatchTolerance set_pipeline_threads buildNativeReversePool analyzeAll enumeratePairs buildMetricsArray reducePairInfosByPenalty reducePrimersByOverlap reduceSignaturesByOverlap flattenInfoData buildBigMerge calculateSignatureIntersection createPerSignatureFiles createAmplificationFiles analyzeSignatureCombinations generateCombinations injectFixedPrimers findPrimerPositionInAlignment computeFixedPrimerWindows); # buildReversePrimers retire (DEPRECATED, remplace par buildNativeReversePool)
+use LLNL::LAVA::ForkManager;
 
 # Activer l'auto-flush de STDOUT pour les logs temps réel via Flask / Enable STDOUT auto-flush for real-time logs via Flask
 # Enable STDOUT autoflush for real-time log streaming via Flask
@@ -103,7 +145,6 @@ STDERR->autoflush(1);
 # Detect interactive terminal: in-place bar if TTY, silent if redirected to file
 our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
 
-
 ################################################################################
 # FONCTIONS DE VALIDATION ET D'ANALYSE DES SIGNATURES
 # Ces fonctions sont desormais dans LLNL::LAVA::PipelineUtils (Phase 36).
@@ -115,158 +156,6 @@ our $_LAVA_IS_TTY = -t STDERR ? 1 : 0;
 #   - createAmplificationFiles
 #   - calculateDynamicPairLengths
 ################################################################################
-=head2 getOligosWithMismatchTolerance
-
-Version améliorée de getOligos qui intègre la tolérance aux mismatches. / Improved version of getOligos that integrates mismatch tolerance.
-
-=cut
-
-sub getOligosWithMismatchTolerance {
-  my ($enumerator, $alignment, $min_match_percent, $min_iupac_percent, $min_primer_coverage,
-      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency) = @_;
-  
-  my $sequenceCount = $alignment->num_sequences();
-  if ($sequenceCount <= 0) {
-    confess("data error - MSA must contain at least one sequence");
-  }
-  
-  print "INFO: Utilisation de la tolérance aux mismatches activée\n";
-  print "  - Seuil de concordance stricte / Strict match threshold: ${min_match_percent}%\n";
-  print "  - Seuil de couverture IUPAC / IUPAC coverage threshold: ${min_iupac_percent}%\n";
-  
-  my @sequences = ();
-  foreach my $sequence ($alignment->each_seq()) {
-    my $seqContent = $sequence->seq();
-    $seqContent = uc($seqContent);  # Convertir en majuscules d'abord / Convert to uppercase first
-    $seqContent =~ s/[^ATCG]/N/g;  # Puis normaliser (remplacer caractères non-ADN par N) / Then normalize (replace non-DNA characters with N)
-    push @sequences, $seqContent;
-  }
-  
-  my @candidatePrimers = $enumerator->getOligos($alignment);
-  my @validatedPrimers = ();
-  my $strict_count = 0;
-  my $degenerate_count = 0;
-  my $rejected_count = 0;
-  
-  my $nb_fwd_candidates = scalar(@candidatePrimers);
-  print "INFO: Analyse de $nb_fwd_candidates amorces candidates Forward avec tolerance aux mismatches...\n";
-
-  # Barre de progression / Progress bar (auto-detect Term::ProgressBar ou ASCII fallback)
-  my $_has_pb = eval { require Term::ProgressBar; 1 } || 0;
-  my $_pb_obj = undef;
-  my $_pb_t0  = time();
-  if ($_has_pb && -t STDOUT) {
-    $_pb_obj = Term::ProgressBar->new({
-      name   => "Forward Validation",
-      count  => $nb_fwd_candidates,
-      ETA    => 'linear',
-      remove => 0,
-      fh     => \*STDERR,
-    });
-    $_pb_obj->minor(0);
-  }
-  my $_pb_done = 0;
-
-  foreach my $primer (@candidatePrimers) {
-    my $location = $primer->location();
-    my $length = $primer->length();
-    my $original_sequence = $primer->sequence();
-    
-    my ($final_sequence, $coverage_percent, $is_degenerate, $compatible_seq_ids) = 
-      checkPrimerMismatchTolerance(\@sequences, $location, $length, $original_sequence,
-                                  $min_match_percent, $min_iupac_percent, $min_primer_coverage,
-                                  $maxTotalDegen, $maxConsecDegen, 
-                                  $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
-    
-    # Utiliser le même seuil que l'algorithme interne (paramètre passé à la fonction) / Use the same threshold as the internal algorithm (parameter passed to the function)
-    my $min_primer_acceptance = $min_primer_coverage;
-    if ($coverage_percent >= $min_primer_acceptance) {
-      my $validatedPrimer = $primer->clone();
-      
-      if ($is_degenerate) {
-        $validatedPrimer->sequence($final_sequence);
-        $validatedPrimer->setTag("is_degenerate", 1);
-        $validatedPrimer->setTag("original_sequence", $original_sequence);
-        $validatedPrimer->setTag("iupac_coverage", sprintf("%.1f", $coverage_percent));
-        $validatedPrimer->setTag("compatible_sequence_ids", $compatible_seq_ids);
-        $degenerate_count++;
-        
-        print "DEGENERATE PRIMER acceptée - Pos: $location, Couv: " . 
-              sprintf("%.1f", $coverage_percent) . "%, Seq: $final_sequence\n";
-        # Mise à jour barre / Update progress bar
-        $_pb_done++;
-        if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
-        elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          # Ligne de progression structuree pour Flask / Structured progress line for Flask
-          if ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-            my $pct = int($_pb_done/$nb_fwd_candidates*100);
-            my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                      ? int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001)))
-                      : 0;
-            my $rate = $_pb_done / (time()-$_pb_t0+0.001);
-            printf("[LAVA-PROGRESS] Validation Forward|%d|%d|OK:%d DEG:%d REJ:%d|%.0f it/s|%d\n",
-                   $_pb_done,$nb_fwd_candidates,$strict_count,$degenerate_count,$rejected_count,$rate,$eta);
-          }
-        }
-      } else {
-        $validatedPrimer->setTag("is_degenerate", 0);
-        $validatedPrimer->setTag("iupac_coverage", "100.0");
-        $validatedPrimer->setTag("compatible_sequence_ids", $compatible_seq_ids);
-        $strict_count++;
-        # Mise à jour barre / Update progress bar
-        $_pb_done++;
-        if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
-        elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          # Ligne de progression structuree pour Flask / Structured progress line for Flask
-          if ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-            my $pct = int($_pb_done/$nb_fwd_candidates*100);
-            my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                      ? int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001)))
-                      : 0;
-            my $rate = $_pb_done / (time()-$_pb_t0+0.001);
-            printf("[LAVA-PROGRESS] Validation Forward|%d|%d|OK:%d DEG:%d REJ:%d|%.0f it/s|%d\n",
-                   $_pb_done,$nb_fwd_candidates,$strict_count,$degenerate_count,$rejected_count,$rate,$eta);
-          }
-        }
-      }
-      
-      push @validatedPrimers, $validatedPrimer;
-    } else {
-      $rejected_count++;
-      print "REJECTED PRIMER - Pos: $location, Couv: " . 
-            sprintf("%.1f", $coverage_percent) . "% < ${min_primer_acceptance}%\n";
-      # Mise à jour barre / Update progress bar
-      $_pb_done++;
-      if ($_has_pb && $_pb_obj) { $_pb_obj->update($_pb_done); }
-      elsif ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-        # Ligne de progression structuree pour Flask / Structured progress line for Flask
-        if ($_pb_done % 200 == 0 || $_pb_done == $nb_fwd_candidates) {
-          my $pct = int($_pb_done/$nb_fwd_candidates*100);
-          my $eta = ($_pb_done > 0 && $_pb_done < $nb_fwd_candidates)
-                    ? int(($nb_fwd_candidates-$_pb_done)/($_pb_done/(time()-$_pb_t0+0.001)))
-                    : 0;
-          my $rate = $_pb_done / (time()-$_pb_t0+0.001);
-          printf("[LAVA-PROGRESS] Validation Forward|%d|%d|OK:%d DEG:%d REJ:%d|%.0f it/s|%d\n",
-                 $_pb_done,$nb_fwd_candidates,$strict_count,$degenerate_count,$rejected_count,$rate,$eta);
-        }
-      }
-    }
-  }
-  
-  # Finaliser la barre / Finalize progress bar
-  if ($_has_pb && $_pb_obj) { $_pb_obj->update($nb_fwd_candidates); }
-  elsif ($_LAVA_IS_TTY) {
-    # Effacer la barre et passer a la ligne suivante / Clear bar and move to next line
-    printf(STDERR "\r%-80s\n", "");
-  }
-  print "RÉSULTATS tolérance mismatches:\n";
-  print "  - Amorces strictes acceptées / accepted: $strict_count\n";
-  print "  - Amorces dégénérées acceptées / accepted: $degenerate_count\n";
-  print "  - Amorces rejetées: $rejected_count\n";
-  print "  - Total validé / Total validated: " . scalar(@validatedPrimers) . "/" . scalar(@candidatePrimers) . "\n\n";
-  
-  return @validatedPrimers;
-}
 
 
 { # Fake main() to enforce scope
@@ -275,8 +164,13 @@ sub getOligosWithMismatchTolerance {
     (
       "alignment_fasta=s" => \$options{"alignment_fasta"},
       "output_file=s" => \$options{"output_file"}, 
+      "threads|cpu=s" => \$options{"threads"},
       "signature_max_length=i" => \$options{"signature_max_length"},
+      "signature_min_length=i" => \$options{"signature_min_length"},
       "total_signature_length=i" => \$options{"total_signature_length"},
+      "signature_length_penalty_weight=f" => \$options{"signature_length_penalty_weight"},
+      "verbose_validation" => \$options{"verbose_validation"},
+      "output_dir=s" => \$options{"output_dir"},
 
       "outer_primer_target_length=i" => \$options{"outer_primer_target_length"},
       "outer_primer_min_length=i" => \$options{"outer_primer_min_length"},
@@ -306,7 +200,9 @@ sub getOligosWithMismatchTolerance {
       "inner_primer_min_tm=f" => \$options{"inner_primer_min_tm"},
       "inner_primer_max_tm=f" => \$options{"inner_primer_max_tm"},
     
-      "max_poly_bases=i" => \$options{"max_poly_bases"}, 
+      "max_poly_bases=i" => \$options{"max_poly_bases"},
+      "assembly_batch_size=i" => \$options{"assembly_batch_size"},
+      "max_retained_signatures=i" => \$options{"max_retained_signatures"}, 
       
       "max_total_degenerate_bases=i" => \$options{"max_total_degenerate_bases"},
       "max_consecutive_degenerate_bases=i" => \$options{"max_consecutive_degenerate_bases"},
@@ -322,7 +218,8 @@ sub getOligosWithMismatchTolerance {
 
       "include_loop_primers=i" => \$options{"include_loop_primers"},
       "loop_min_gap=i" => \$options{"loop_min_gap"},
-      "min_signatures_for_success=i" => \$options{"min_signatures_for_success"},
+
+      "signature_common_target_min_percent=f" => \$options{"signature_common_target_min_percent"},
       "min_primer_spacing=i" => \$options{"min_primer_spacing"},
       "min_inner_pair_spacing=i" => \$options{"min_inner_pair_spacing"},
       "max_overlap_percent=f" => \$options{"max_overlap_percent"},
@@ -330,9 +227,6 @@ sub getOligosWithMismatchTolerance {
       # --- REDUCTION SPATIALE PAR FENETRE / SPATIAL WINDOW REDUCTION ---
       "window_size=i"    => \$options{"window_size"},    # largeur fenetre en nt (0=desactive)
       "max_per_window=i" => \$options{"max_per_window"}, # max candidats par fenetre
-      # Calcul dynamique des longueurs (porte depuis STEM / ported from STEM)
-      "max_dist_outer_middle=i" => \$options{"max_dist_outer_middle"},
-      "max_dist_middle_inner=i" => \$options{"max_dist_middle_inner"},
 
       "primer3_executable=s" => \$options{"primer3_executable"},
       "thermodynamic_path=s" => \$options{"thermodynamic_path"},
@@ -346,14 +240,23 @@ sub getOligosWithMismatchTolerance {
       "max_tm_diff=f" => \$options{"max_tm_diff"}, # new
 
       # Sigmoid Penalty Parameters
-      "penalty_plateau=f" => \$options{"penalty_plateau"},
-      "penalty_slope=f" => \$options{"penalty_slope"},
+      "spacing_middle_outer_free=i" => \$options{"spacing_middle_outer_free"},
+      "spacing_middle_outer_saturation=i" => \$options{"spacing_middle_outer_saturation"},
+      "spacing_loop_middle_free=i" => \$options{"spacing_loop_middle_free"},
+      "spacing_loop_middle_saturation=i" => \$options{"spacing_loop_middle_saturation"},
+      "spacing_inner_loop_free=i" => \$options{"spacing_inner_loop_free"},
+      "spacing_inner_loop_saturation=i" => \$options{"spacing_inner_loop_saturation"},
+      "spacing_inner_middle_free=i" => \$options{"spacing_inner_middle_free"},
+      "spacing_inner_middle_saturation=i" => \$options{"spacing_inner_middle_saturation"},
+      "spacing_inner_inner_free=i" => \$options{"spacing_inner_inner_free"},
+      "spacing_inner_inner_saturation=i" => \$options{"spacing_inner_inner_saturation"},
 
-      # --- NOUVEAUX PARAMÈTRES DE TOLÉRANCE AUX MISMATCHES ---
+
+      # --- NOUVEAUX PARAMÈTRES DE TOLÉRANCE AUX MISMATCHES (AVEC ALIAS HARMONISÉS) ---
       "primer_min_match_percent=f" => \$options{"primer_min_match_percent"},
-      "primer_iupac_min_percent=f" => \$options{"primer_iupac_min_percent"},
-      "min_primer_coverage=f" => \$options{"min_primer_coverage"},
-      # --------------------------------------------------------
+      "primer_min_iupac_percent|primer_iupac_min_percent=f" => \$options{"primer_min_iupac_percent"},
+      "primer_min_coverage_percent|min_primer_coverage=f" => \$options{"primer_min_coverage_percent"},
+      # ---------------------------------------------------------------------------------
 
       # TODO: Not sure if the pair target lengths should be exposed to the 
       # user, or adjusted based on other parameters
@@ -362,11 +265,21 @@ sub getOligosWithMismatchTolerance {
       #"inner_pair_target_length=i" => \$options{"inner_pair_target_length"}, 
 
       "option_file|options_file=s" => \$options{"option_file"},
+      # --- AMORCES FIXEES (peut etre repete plusieurs fois) ---
+      # --- FIXED PRIMERS (can be repeated multiple times) ---
+      "fixed_primer=s" => \@{$options{"fixed_primer"}},
+      "fixed_primer_optimize=i" => \$options{"fixed_primer_optimize"},
     );
 
   my %optionDefaults =
     (
-      "signature_max_length" => 320,
+      "threads" => "auto",
+      "fixed_primer" => [],  # Tableau d'amorces fixees / Array of fixed primers
+      "fixed_primer_optimize" => 1,
+      "signature_max_length" => 400,
+      "signature_min_length" => 0,
+      "total_signature_length" => 250,
+      "signature_length_penalty_weight" => 10,
       "outer_primer_target_length" => 20,
       "outer_primer_min_length" => 18,
       "outer_primer_max_length" => 23,
@@ -386,7 +299,8 @@ sub getOligosWithMismatchTolerance {
       "max_poly_bases" => 2,
       "include_loop_primers" => 1,
       "loop_min_gap" => 25,
-      "min_signatures_for_success" => 1, # Should probably never go lower
+
+      "signature_common_target_min_percent" => 70,
       "min_primer_spacing" => 1,
       "min_inner_pair_spacing" => 1,
       # Some LAMP-specific approximate targets for a "minimum sized" signature
@@ -397,12 +311,11 @@ sub getOligosWithMismatchTolerance {
       "inner_pair_target_length" => 50, 
       "max_overlap_percent" => 0,
       "resolve_overlap_by" => "penalty",
-      # Calcul dynamique (porte depuis STEM / ported from STEM)
-      "max_dist_outer_middle" => 30,
-      "max_dist_middle_inner" => 30,
       # --- PARAMETRES DE TOLERANCE AUX MISMATCHES ---
       "primer_min_match_percent" => 80,
+      "primer_min_iupac_percent" => 98,
       "primer_iupac_min_percent" => 98,
+      "primer_min_coverage_percent" => 80,
       "min_primer_coverage" => 80,
       # -----------------------------------------
       "dntp_conc" => 1.4,
@@ -410,8 +323,17 @@ sub getOligosWithMismatchTolerance {
       "salt_monovalent" => 50,
       "salt_monovalent" => 50,
       "dna_conc" => 400,
-      "penalty_plateau" => 0.25,
-      "penalty_slope" => 0.15,
+      "spacing_middle_outer_free" => 49,
+      "spacing_middle_outer_saturation" => 86,
+      "spacing_loop_middle_free" => 15,
+      "spacing_loop_middle_saturation" => 27,
+      "spacing_inner_loop_free" => 19,
+      "spacing_inner_loop_saturation" => 45,
+      "spacing_inner_middle_free" => 49,
+      "spacing_inner_middle_saturation" => 76,
+      "spacing_inner_inner_free" => 51,
+      "spacing_inner_inner_saturation" => 104,
+
       "max_primer_gen" => 10001, # primer3 rounding error off by 1?
       "max_primer_gen" => 10001, # primer3 rounding error off by 1?
       "primer3_executable" => "/usr/bin/primer3_core",
@@ -426,9 +348,9 @@ sub getOligosWithMismatchTolerance {
     "./lava.pl \n" .
       "    --alignment_fasta <fasta_file>\n" .
       "    --output_file <output_file>\n" .
-      "    [--signature_max_length <length, deafult=" .
+      "    [--signature_max_length <length, default=" .
         $optionDefaults{"signature_max_length"} .
-	">]\n" .
+	">\n" .
       # Outer primer options
       "    [--outer_primer_target_length <length, default=" .
         $optionDefaults{"outer_primer_target_length"} .
@@ -515,8 +437,9 @@ sub getOligosWithMismatchTolerance {
       "    [--loop_min_gap <length, default=" .
         $optionDefaults{"loop_min_gap"} .
 	">]\n" .
-      "    [--min_signatures_for_success <length, default=" .
-        $optionDefaults{"min_signatures_for_success"} .
+
+      "    [--signature_common_target_min_percent <float, default=" .
+        $optionDefaults{"signature_common_target_min_percent"} .
   ">]\n" .
     "    [--max_overlap_percent <length, default=" .
       $optionDefaults{"max_overlap_percent"} .
@@ -540,12 +463,12 @@ sub getOligosWithMismatchTolerance {
       "    [--primer_min_match_percent <percent, default=" .
         $optionDefaults{"primer_min_match_percent"} .
 	">]\n" .
-      "    [--primer_iupac_min_percent <percent, default=" .
-        $optionDefaults{"primer_iupac_min_percent"} .
-	">]\n" .
-      "    [--min_primer_coverage <percent, default=" .
-        $optionDefaults{"min_primer_coverage"} .
-	">]\n" .
+      "    [--primer_min_iupac_percent <percent, default=" .
+        $optionDefaults{"primer_min_iupac_percent"} .
+	"> (alias: --primer_iupac_min_percent)]\n" .
+      "    [--primer_min_coverage_percent <percent, default=" .
+        $optionDefaults{"primer_min_coverage_percent"} .
+	"> (alias: --min_primer_coverage)]\n" .
       # -----------------------------------------
       "    [--primer3_executable <path_to_primer3, default=" .
         $optionDefaults{"primer3_executable"} .
@@ -556,14 +479,12 @@ sub getOligosWithMismatchTolerance {
       "    [--alignment_format <file format of alignment, default=\"" .
         $optionDefaults{"alignment_format"} .
 	"\">]\n" .
-      "    [--penalty_plateau <float, default=" . $optionDefaults{"penalty_plateau"} . ">]\n" .
-      "    [--penalty_slope <float, default=" . $optionDefaults{"penalty_slope"} . ">]\n" .
       "    [--option_file <options_xml> (cmd line options take precedence)]\n";
 
   # TODO: Probably want to be able to use multiple files for parameter
   # definition, so we can have the thermo parameters set, and separately have
   # the file IO parameters.
-  GetOptions(%optionMap);
+  GetOptions(%optionMap) or die "FATAL: Options de ligne de commande invalides (Unknown option).\n";
   loadOptionsFromFile(\%options);
   my $options_r = \%options;
 
@@ -573,10 +494,19 @@ sub getOligosWithMismatchTolerance {
 
   my $signatureMaxLength = 
     optionWithDefault($options_r, "signature_max_length", 
-      300);
+      $optionDefaults{"signature_max_length"});
+  my $signatureMinLength = optionWithDefault($options_r, "signature_min_length", $optionDefaults{"signature_min_length"});
   my $totalSignatureLength = 
     optionWithDefault($options_r, "total_signature_length",
-      $signatureMaxLength); # Default to max length if not specified
+      $optionDefaults{"total_signature_length"});
+  my $signatureLengthPenaltyWeight = optionWithDefault($options_r, "signature_length_penalty_weight", $optionDefaults{"signature_length_penalty_weight"});
+
+
+  if ($totalSignatureLength > $signatureMaxLength) {
+      print "[ATTENTION] total_signature_length ($totalSignatureLength) est superieur a signature_max_length ($signatureMaxLength).\n";
+      print "            Recadrage de la cible sur le plafond ($signatureMaxLength).\n";
+      $totalSignatureLength = $signatureMaxLength;
+  }
 
   my $maxTotalDegen = optionWithDefault($options_r, "max_total_degenerate_bases", 2);
   my $maxConsecDegen = optionWithDefault($options_r, "max_consecutive_degenerate_bases", 2);
@@ -587,6 +517,47 @@ sub getOligosWithMismatchTolerance {
   print "Config: Min Base Frequency = $minBaseFrequency\n";
   my $entropyThreshold = optionWithDefault($options_r, "entropy_threshold", 1.5);
   my $maxTmDiff = optionWithDefault($options_r, "max_tm_diff", 5.0);
+
+  # --- Parsing des amorces fixees / Parsing of fixed primers ---
+  # Format accepte : TYPE:SEQUENCE  ou  TYPE:SEQUENCE:POSITION
+  # Accepted format: TYPE:SEQUENCE  or  TYPE:SEQUENCE:POSITION
+  # Types valides LOOP : F3 B3 F2 B2 F1C B1C FLOOP BLOOP
+  # Valid types LOOP:   F3 B3 F2 B2 F1C B1C FLOOP BLOOP
+  my @fixedPrimerSpecs = ();
+  my $fixedPrimerWindows_r = {};  # Fenetre geometrique calculee / Computed geometric window
+  my @raw_fixed = @{ $options{"fixed_primer"} // [] };
+  for my $raw (@raw_fixed) {
+    my @parts = split(/:/, $raw, 3);
+    if (@parts < 2 || !$parts[0] || !$parts[1]) {
+      print "[FIXED PRIMER] AVERTISSEMENT: Format invalide '$raw'. Attendu TYPE:SEQUENCE ou TYPE:SEQUENCE:POSITION. Ignore.\n";
+      print "[FIXED PRIMER] WARNING: Invalid format '$raw'. Expected TYPE:SEQUENCE or TYPE:SEQUENCE:POSITION. Skipped.\n";
+      next;
+    }
+    my $type = uc($parts[0]);
+    $type = "F1C" if $type eq "F1";
+    $type = "B1C" if $type eq "B1";
+    
+    my $spec = {
+      type => $type,
+      seq  => uc($parts[1]),
+      pos  => (defined $parts[2] && $parts[2] =~ /^\d+$/) ? int($parts[2]) : undef,
+    };
+    # Validation du type pour LOOP
+    my %valid_loop_types = map { $_ => 1 } qw(F3 B3 F2 B2 F1C B1C FLOOP BLOOP);
+    if (!$valid_loop_types{$spec->{type}}) {
+      print STDERR "ERROR: [FIXED PRIMER] Type '$spec->{type}' non reconnu pour LOOP. Types valides: F3 B3 F2 B2 F1C B1C FLOOP BLOOP (F1 et B1 sont acceptes comme alias de F1C et B1C).\n";
+      exit(2);
+    }
+    push @fixedPrimerSpecs, $spec;
+    printf("[FIXED PRIMER] Spec enregistree: TYPE=%s SEQ=%s POS=%s\n",
+           $spec->{type}, $spec->{seq}, defined $spec->{pos} ? $spec->{pos} : "auto");
+  }
+  my %isFixedType = ();
+  for my $spec (@fixedPrimerSpecs) {
+    $isFixedType{$spec->{type}} = 1;
+  }
+
+
 
   my $outerPrimerTargetLength =
     optionWithDefault($options_r, "outer_primer_target_length", 
@@ -612,17 +583,10 @@ sub getOligosWithMismatchTolerance {
   my $outerPrimerMinTM =
     optionWithDefault($options_r, "outer_primer_min_tm", 
       ($outerPrimerTargetTM - 1.0));
-  if($outerPrimerMinTM > $outerPrimerTargetTM)
-  {
-    $outerPrimerMinTM = $outerPrimerTargetTM;
-  }
   my $outerPrimerMaxTM =
     optionWithDefault($options_r, "outer_primer_max_tm", 
       ($outerPrimerTargetTM + 1.0));
-  if($outerPrimerMaxTM < $outerPrimerTargetTM)
-  {
-    $outerPrimerMaxTM = $outerPrimerTargetTM;
-  }
+  clamp_tm_target(\$outerPrimerTargetTM, $outerPrimerMinTM, $outerPrimerMaxTM, "outer_primer");
 
   my $loopPrimerTargetLength =
     optionWithDefault($options_r, "loop_primer_target_length", 
@@ -648,17 +612,10 @@ sub getOligosWithMismatchTolerance {
   my $loopPrimerMinTM =
     optionWithDefault($options_r, "loop_primer_min_tm", 
       ($loopPrimerTargetTM - 1.0));
-  if($loopPrimerMinTM > $loopPrimerTargetTM)
-  {
-    $loopPrimerMinTM = $loopPrimerTargetTM;
-  }
   my $loopPrimerMaxTM =
     optionWithDefault($options_r, "loop_primer_max_tm", 
       ($loopPrimerTargetTM + 1.0));
-  if($loopPrimerMaxTM < $loopPrimerTargetTM)
-  {
-    $loopPrimerMaxTM = $loopPrimerTargetTM;
-  }
+  clamp_tm_target(\$loopPrimerTargetTM, $loopPrimerMinTM, $loopPrimerMaxTM, "loop_primer");
 
 
   my $middlePrimerTargetLength =
@@ -685,17 +642,10 @@ sub getOligosWithMismatchTolerance {
   my $middlePrimerMinTM =
     optionWithDefault($options_r, "middle_primer_min_tm", 
       ($middlePrimerTargetTM - 1.0));
-  if($middlePrimerMinTM > $middlePrimerTargetTM)
-  {
-    $middlePrimerMinTM = $middlePrimerTargetTM;
-  }
   my $middlePrimerMaxTM =
     optionWithDefault($options_r, "middle_primer_max_tm", 
       ($middlePrimerTargetTM + 1.0));
-  if($middlePrimerMaxTM < $middlePrimerTargetTM)
-  {
-    $middlePrimerMaxTM = $middlePrimerTargetTM;
-  }
+  clamp_tm_target(\$middlePrimerTargetTM, $middlePrimerMinTM, $middlePrimerMaxTM, "middle_primer");
 
   my $innerPrimerTargetLength =
     optionWithDefault($options_r, "inner_primer_target_length", 
@@ -721,17 +671,10 @@ sub getOligosWithMismatchTolerance {
   my $innerPrimerMinTM =
     optionWithDefault($options_r, "inner_primer_min_tm", 
       ($innerPrimerTargetTM - 1.0));
-  if($innerPrimerMinTM > $innerPrimerTargetTM)
-  {
-    $innerPrimerMinTM = $innerPrimerTargetTM;
-  }
   my $innerPrimerMaxTM =
     optionWithDefault($options_r, "inner_primer_max_tm", 
       ($innerPrimerTargetTM + 1.0));
-  if($innerPrimerMaxTM < $innerPrimerTargetTM)
-  {
-    $innerPrimerMaxTM = $innerPrimerTargetTM;
-  }
+  clamp_tm_target(\$innerPrimerTargetTM, $innerPrimerMinTM, $innerPrimerMaxTM, "inner_primer");
 
   my $maxPolyBases = 
     optionWithDefault($options_r, "max_poly_bases", 
@@ -744,8 +687,8 @@ sub getOligosWithMismatchTolerance {
     optionWithDefault($options_r, "loop_min_gap", 
       $optionDefaults{"loop_min_gap"});
   my $signatureCommonTargetMinPercent =
-    optionWithDefault($options_r, "min_signatures_for_success",
-      $optionDefaults{"min_signatures_for_success"});
+    optionWithDefault($options_r, "signature_common_target_min_percent",
+      $optionDefaults{"signature_common_target_min_percent"});
   my $maxSigOverlapPercent = 
     optionWithDefault($options_r, "max_overlap_percent",
       $optionDefaults{"max_overlap_percent"});
@@ -762,9 +705,6 @@ sub getOligosWithMismatchTolerance {
   my $saltMonovalent = 
     optionWithDefault($options_r, "salt_monovalent",
      $optionDefaults{"salt_monovalent"});
-
-  my $penaltyPlateau = optionWithDefault($options_r, "penalty_plateau", $optionDefaults{"penalty_plateau"});
-  my $penaltySlope = optionWithDefault($options_r, "penalty_slope", $optionDefaults{"penalty_slope"});
 
   my $saltDivalent = 
     optionWithDefault($options_r, "salt_divalent",
@@ -792,38 +732,6 @@ sub getOligosWithMismatchTolerance {
     optionWithDefault($options_r, "inner_pair_target_length", 
       $optionDefaults{"inner_pair_target_length"});
 
-  # --- CALCUL DYNAMIQUE DES LONGUEURS CIBLES (PipelineUtils, porte depuis STEM) ---
-  # --- DYNAMIC TARGET LENGTH CALCULATION (PipelineUtils, ported from STEM) ---
-  if (exists $options_r->{"max_dist_outer_middle"} || exists $options_r->{"max_dist_middle_inner"})
-  {
-    my $maxDistOuterMiddle = 
-      optionWithDefault($options_r, "max_dist_outer_middle",
-        $optionDefaults{"max_dist_outer_middle"});
-    my $maxDistMiddleInner =
-      optionWithDefault($options_r, "max_dist_middle_inner",
-        $optionDefaults{"max_dist_middle_inner"});
-
-    # --- CORRECTION DE CONFLIT LOOP (Phase 36) ---
-    # maxDistMiddleInner représente la distance cible / maxDistMiddleInner represents the target distance (Middle -> Inner) / 2 = F2_len + gap(F2, F1c).
-    # Mais dans LOOP, gap(F2, F1c) doit être au minimum de loopMinGap pour accommoder le Loop primer.
-    # Donc maxDistMiddleInner DOIT être >= middlePrimerTargetLength + loopMinGap.
-    if ($includeLoopPrimers) {
-      my $middlePrimerTargetLength = optionWithDefault($options_r, "middle_primer_target_length", $optionDefaults{"middle_primer_target_length"});
-      my $min_required_dist = $middlePrimerTargetLength + $loopMinGap;
-      
-      if ($maxDistMiddleInner < $min_required_dist) {
-        print "\nWARNING: max_dist_middle_inner ($maxDistMiddleInner) est trop petit pour accommoder loop_min_gap ($loopMinGap).\n";
-        print "WARNING: Pour eviter un conflit geometrique bloquant, max_dist_middle_inner est ajuste automatiquement a $min_required_dist.\n";
-        $maxDistMiddleInner = $min_required_dist;
-      }
-    }
-
-    ($middlePairTargetLength, $innerPairTargetLength) = calculateDynamicPairLengths(
-      $outerPairTargetLength, $maxDistOuterMiddle, $maxDistMiddleInner, $minInnerPairSpacing
-    );
-  }
-  # --- FIN DU CALCUL DYNAMIQUE ---
-
   # Eventually want to let the user specify which penalty method
   # is used to calculate the spacing penalty, making the objective function
   # more customizable
@@ -835,13 +743,18 @@ sub getOligosWithMismatchTolerance {
   my $alignmentFormat = optionWithDefault($options_r, "alignment_format",
     $optionDefaults{"alignment_format"});
 
-  # --- RÉCUPÉRATION DES PARAMÈTRES DE TOLÉRANCE AUX MISMATCHES ---
+  # --- RÉCUPÉRATION DES PARAMÈTRES DE TOLÉRANCE AUX MISMATCHES (AVEC ALIAS HARMONISÉS) ---
+  $options_r->{"primer_min_iupac_percent"} //= $options_r->{"primer_iupac_min_percent"};
+  $options_r->{"primer_iupac_min_percent"} //= $options_r->{"primer_min_iupac_percent"};
+  $options_r->{"primer_min_coverage_percent"} //= $options_r->{"min_primer_coverage"};
+  $options_r->{"min_primer_coverage"} //= $options_r->{"primer_min_coverage_percent"};
+
   my $primerMinMatchPercent = optionWithDefault($options_r, "primer_min_match_percent",
     $optionDefaults{"primer_min_match_percent"});
-  my $primerIupacMinPercent = optionWithDefault($options_r, "primer_iupac_min_percent", 
-    $optionDefaults{"primer_iupac_min_percent"});
-  my $minPrimerCoverage = optionWithDefault($options_r, "min_primer_coverage", 
-    $optionDefaults{"min_primer_coverage"});
+  my $primerIupacMinPercent = optionWithDefault($options_r, "primer_min_iupac_percent", 
+    $optionDefaults{"primer_min_iupac_percent"});
+  my $minPrimerCoverage = optionWithDefault($options_r, "primer_min_coverage_percent", 
+    $optionDefaults{"primer_min_coverage_percent"});
   
   print "Configuration tolérance mismatches:\n";
   print "  - Match strict minimum: ${primerMinMatchPercent}%\n";
@@ -862,14 +775,102 @@ sub getOligosWithMismatchTolerance {
   my $middleToOuterPenaltyWeight = 0.5;
   my $innerForwardToReversePenaltyWeight = 0.5;
 
+  set_pipeline_threads($options_r->{"threads"});
+
   # Let the games begin...
 
   # Load the input alignment, could be a single sequence
   # TODO: # Make sure the alignment format option suggestion is working
   my $alignIN = Bio::AlignIO->new(-file => "< $alignmentFastaName", -format => $alignmentFormat);
   my $inputMSA = $alignIN->next_aln();
+
+  if (!$inputMSA || $inputMSA->num_sequences() < 1) {
+    print STDERR "ERROR: INPUT_EMPTY - Le fichier ne contient aucune sequence valide.\n";
+    exit(2);
+  }
+
+  if ($inputMSA->num_sequences() >= 2) {
+    if (!$inputMSA->is_flush()) {
+      print STDERR "ERROR: INPUT_NOT_ALIGNED - Les sequences n'ont pas toutes la meme longueur. Le fichier doit etre un alignement multiple (MSA), pas des sequences brutes.\n";
+      exit(2);
+    }
+
+    # Verification supplementaire : Bio::AlignIO (BioPerl) ajoute automatiquement des tirets (-) 
+    # a la fin des sequences plus courtes lors de la lecture, ce qui fait que is_flush() renvoie 1 
+    # meme sur un fichier FASTA non aligne. Nous verifions donc que les sequences brutes dans le fichier 
+    # ont bien la meme longueur avant padding.
+    if (open(my $fh_check, '<', $alignmentFastaName)) {
+      my %raw_lengths;
+      my $cur_len = 0;
+      my $cur_id = "";
+      while (my $line = <$fh_check>) {
+        chomp $line;
+        if ($line =~ /^>/) {
+          if ($cur_id ne "" && $cur_len > 0) {
+            $raw_lengths{$cur_len} = 1;
+          }
+          $cur_id = $line;
+          $cur_len = 0;
+        } else {
+          $line =~ s/\r//g;
+          $cur_len += length($line);
+        }
+      }
+      if ($cur_id ne "" && $cur_len > 0) {
+        $raw_lengths{$cur_len} = 1;
+      }
+      close($fh_check);
+      if (scalar(keys %raw_lengths) > 1) {
+        print STDERR "ERROR: INPUT_NOT_ALIGNED - Les sequences n'ont pas toutes la meme longueur (" . join(", ", keys %raw_lengths) . " bp). Le fichier doit etre un alignement multiple (MSA), pas des sequences brutes.\n";
+        exit(2);
+      }
+    }
+  }
+
   my $sequenceLength = $inputMSA->length;
-  
+
+  # --- Resolution anticipee des positions des amorces fixees ---
+  # --- Early position resolution for fixed primers ---
+  # On resout les positions maintenant (avant Primer3) pour pouvoir calculer
+  # la fenetre geometrique et filtrer les candidats AVANT leur generation.
+  # We resolve positions now (before Primer3) to compute the geometric window
+  # and filter candidates BEFORE their generation.
+  if (@fixedPrimerSpecs) {
+    print "\n[FIXED PRIMER WINDOW] Resolution anticipee des positions / Early position resolution...\n";
+    for my $spec (@fixedPrimerSpecs) {
+      next if defined $spec->{pos};  # position deja fournie / already provided
+      my ($found_pos, $found_strand) = findPrimerPositionInAlignment($inputMSA, $spec->{seq}, undef);
+      if (defined $found_pos) {
+        $spec->{pos}    = $found_pos;
+        $spec->{strand} = $found_strand;
+        printf("[FIXED PRIMER WINDOW] %s '%s' -> position resolue : %d (brin %s)\n",
+               $spec->{type}, $spec->{seq}, $found_pos, $found_strand);
+      } else {
+        print "[FIXED PRIMER WINDOW] AVERTISSEMENT: position introuvable pour $spec->{type} '$spec->{seq}'. Fenetre non contrainte pour cette amorce.\n";
+        print "[FIXED PRIMER WINDOW] WARNING: position not found for $spec->{type} '$spec->{seq}'. No window constraint for this primer.\n";
+      }
+    }
+
+    my $fixed_window_margin = optionWithDefault($options_r, "fixed_primer_margin", 200);
+    my $current_sig_max = optionWithDefault($options_r, "signature_max_length", 320);
+    $fixedPrimerWindows_r = computeFixedPrimerWindows(
+      \@fixedPrimerSpecs, $current_sig_max, $fixed_window_margin, $sequenceLength
+    );
+  }
+
+
+  my $global_included_region = undef;
+  if (%{$fixedPrimerWindows_r}) {
+    my $win = $fixedPrimerWindows_r->{"F3"};
+    if (defined $win) {
+      my $len = $win->[1] - $win->[0] + 1;
+      if ($len > 0) {
+        $global_included_region = $win->[0] . "," . $len;
+        print "[FIXED PRIMER WINDOW] Passing SEQUENCE_INCLUDED_REGION=$global_included_region to Primer3\n";
+      }
+    }
+  }
+
   # Extraire les objets de séquence pour la génération des fichiers FASTA / Extract sequence objects for FASTA file generation
   my @sequence_objects = ();
   my @sequence_names = ();
@@ -903,16 +904,20 @@ sub getOligosWithMismatchTolerance {
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   print "Enumerating outer forward primers\n";
-  my @outerForwardPrimers = getOligosWithMismatchTolerance($outerEnumerator, $inputMSA,
+  my @outerForwardPrimers = ();
+  if ($isFixedType{"F3"}) {
+    print "Skipping outer forward (F3) enumeration because it is fixed.\n";
+  } else {
+    @outerForwardPrimers = getOligosWithMismatchTolerance($outerEnumerator, $inputMSA,
                                                           $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-                                                          $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
+                                                          $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Outer Forward (F3)");
 
-  print "  Generated \"" .
-    scalar(@outerForwardPrimers) .
-    "\" outer forward primers\n";
+    print "  Generated \"" . scalar(@outerForwardPrimers) . "\" outer forward primers\n";
+  }
   
   # DEBUG : Vérifier que les primers ont le tag compatible_sequence_ids / Verify that primers have the compatible_sequence_ids tag
   my $outer_with_tag = 0;
@@ -925,17 +930,22 @@ sub getOligosWithMismatchTolerance {
 
 
   # Option B : Generation NATIVE des Reverse Outer via Primer3 sur RC(MSA)
-  # Les Reverse sont generes independamment des Forward - protection 3' garantie
+  # Les Reverse sont generes independamment des Forward — protection 3' garantie
   # Option B: NATIVE Outer Reverse generation via Primer3 on RC(MSA)
-  # Reverse primers generated independently from Forward - 3' protection guaranteed
+  # Reverse primers generated independently from Forward — 3' protection guaranteed
   print "Enumerating outer NATIVE reverse primers (Option B)\n";
-  my @outerReversePrimers = buildNativeReversePool(
-    $outerEnumerator, $inputMSA,
-    $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-    \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp
-  );
-  print "  Generated \"" . scalar(@outerReversePrimers) . "\" outer native reverse primers\n";
+  my @outerReversePrimers = ();
+  if ($isFixedType{"B3"}) {
+    print "Skipping outer reverse (B3) enumeration because it is fixed.\n";
+  } else {
+    @outerReversePrimers = buildNativeReversePool(
+      $outerEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Outer Reverse (B3)"
+    );
+    print "  Generated \"" . scalar(@outerReversePrimers) . "\" outer native reverse primers\n";
+  }
 
 
   # Enumerate loop primers, since the loop primers extend in the opposite 
@@ -961,6 +971,7 @@ sub getOligosWithMismatchTolerance {
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   # This difference in naming is intentional for now (loopBackPrimers instead of 
@@ -975,25 +986,31 @@ sub getOligosWithMismatchTolerance {
   # BLOOP : genere nativement sur le brin + (Back Loop = sens du brin +, 3' pointe vers B1c)
   # BLOOP: natively generated on plus strand (Back Loop = sense of plus strand, 3' points toward B1c)
   print "Enumerating loop BACK (BLOOP) primers on plus strand\n";
+  if ($isFixedType{"BLOOP"}) {
+    print "Skipping loop BACK (BLOOP) enumeration because it is fixed.\n";
+  } else {
     @loopBackPrimers = getOligosWithMismatchTolerance($loopEnumerator, $inputMSA,
                                                         $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-                                                        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
+                                                        $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Loop Back (BLOOP)");
 
-  print "  Generated \"" .
-    scalar(@loopBackPrimers) .
-    "\" loop BACK (BLOOP) primers\n";
+    print "  Generated \"" . scalar(@loopBackPrimers) . "\" loop BACK (BLOOP) primers\n";
+  }
 
   # FLOOP : Option B - genere nativement sur RC(MSA) pour garantir la protection 3'
   # FLOOP: Option B - natively generated on RC(MSA) to guarantee 3-prime protection
   # (Forward Loop = antisens, 3' pointe vers F1c - correspondait avant au 5' du BLOOP source = bug)
   print "Enumerating loop FORWARD (FLOOP) NATIVE reverse primers (Option B)\n";
+  if ($isFixedType{"FLOOP"}) {
+    print "Skipping loop FORWARD (FLOOP) enumeration because it is fixed.\n";
+  } else {
     @loopForwardPrimers = buildNativeReversePool(
       $loopEnumerator, $inputMSA,
       $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
       $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Loop Forward (FLOOP)"
     );
-  print "  Generated \"" . scalar(@loopForwardPrimers) . "\" loop FORWARD (FLOOP) native primers\n";
+    print "  Generated \"" . scalar(@loopForwardPrimers) . "\" loop FORWARD (FLOOP) native primers\n";
+  }
   } else {
     print "Loop primers désactivés - génération ignorée\n";
   }
@@ -1018,26 +1035,35 @@ sub getOligosWithMismatchTolerance {
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   print "Enumerating middle forward primers\n";
-  my @middleForwardPrimers = getOligosWithMismatchTolerance($middleEnumerator, $inputMSA,
+  my @middleForwardPrimers = ();
+  if ($isFixedType{"F2"}) {
+    print "Skipping middle forward (F2) enumeration because it is fixed.\n";
+  } else {
+    @middleForwardPrimers = getOligosWithMismatchTolerance($middleEnumerator, $inputMSA,
                                                            $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-                                                           $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
+                                                           $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Middle Forward (F2)");
 
-  print "  Generated \"" .
-    scalar(@middleForwardPrimers) .
-    "\" middle primers\n";
+    print "  Generated \"" . scalar(@middleForwardPrimers) . "\" middle primers\n";
+  }
 
   # Option B : Generation NATIVE des Reverse Middle via Primer3 sur RC(MSA)
   print "Enumerating middle NATIVE reverse primers (Option B)\n";
-  my @middleReversePrimers = buildNativeReversePool(
-    $middleEnumerator, $inputMSA,
-    $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-    \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp
-  );
-  print "  Generated \"" . scalar(@middleReversePrimers) . "\" middle native reverse primers\n";
+  my @middleReversePrimers = ();
+  if ($isFixedType{"B2"}) {
+    print "Skipping middle reverse (B2) enumeration because it is fixed.\n";
+  } else {
+    @middleReversePrimers = buildNativeReversePool(
+      $middleEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Middle Reverse (B2)"
+    );
+    print "  Generated \"" . scalar(@middleReversePrimers) . "\" middle native reverse primers\n";
+  }
 
   # Enumerate inner primers 
   my $innerEnumerator = LLNL::LAVA::OligoEnumerator::Primer3Conserved->new(
@@ -1059,16 +1085,20 @@ sub getOligosWithMismatchTolerance {
       "salt_monovalent" => $saltMonovalent,
       "salt_divalent" => $saltDivalent,
       "entropy_threshold" => $entropyThreshold,
+      (defined $global_included_region ? ("included_region" => $global_included_region) : ()),
     });
 
   print "Enumerating inner forward primers\n";
-  my @innerForwardPrimers = getOligosWithMismatchTolerance($innerEnumerator, $inputMSA,
+  my @innerForwardPrimers = ();
+  if ($isFixedType{"F1C"}) {
+    print "Skipping inner forward (F1) enumeration because it is fixed.\n";
+  } else {
+    @innerForwardPrimers = getOligosWithMismatchTolerance($innerEnumerator, $inputMSA,
                                                           $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-                                                          $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency);
+                                                          $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency, "Inner Forward (F1)");
 
-  print "  Generated \"" .
-    scalar(@innerForwardPrimers) .
-    "\" inner primers\n";
+    print "  Generated \"" . scalar(@innerForwardPrimers) . "\" inner primers\n";
+  }
   
   # DEBUG : Vérifier que les primers inner ont le tag / Verify that inner primers have the tag
   my $inner_with_tag = 0;
@@ -1081,13 +1111,18 @@ sub getOligosWithMismatchTolerance {
 
   # Option B : Generation NATIVE des Reverse Inner via Primer3 sur RC(MSA)
   print "Enumerating inner NATIVE reverse primers (Option B)\n";
-  my @innerReversePrimers = buildNativeReversePool(
-    $innerEnumerator, $inputMSA,
-    $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
-    $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
-    \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp
-  );
-  print "  Generated \"" . scalar(@innerReversePrimers) . "\" inner native reverse primers\n";
+  my @innerReversePrimers = ();
+  if ($isFixedType{"B1C"}) {
+    print "Skipping inner reverse (B1) enumeration because it is fixed.\n";
+  } else {
+    @innerReversePrimers = buildNativeReversePool(
+      $innerEnumerator, $inputMSA,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen, $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      \&checkPrimerMismatchTolerance, \&isIUPACCompatible, \&rev_comp, "Inner Reverse (B1)"
+    );
+    print "  Generated \"" . scalar(@innerReversePrimers) . "\" inner native reverse primers\n";
+  }
 
   # TODO: want to flip any primer locations to reflect the standard
   # positive strand 5' location notation if they were generated
@@ -1101,6 +1136,84 @@ sub getOligosWithMismatchTolerance {
   my $middlePrimerAnalyzer = $outerPrimerAnalyzer;
   my $innerPrimerAnalyzer = $outerPrimerAnalyzer;
   my $loopPrimerAnalyzer = $outerPrimerAnalyzer;
+  # --- FILTRAGE GEOMETRIQUE PAR FENETRE (si amorces fixees) ---
+  # --- GEOMETRIC WINDOW FILTERING (if fixed primers are defined) ---
+  # Elimination des candidats geometriquement impossibles AVANT l'injection.
+  # Eliminating geometrically impossible candidates BEFORE injection.
+  # Note: la penalite sigmoide reste inchangee pour les candidats dans la marge.
+  # Note: sigmoid penalty remains unchanged for candidates within the margin.
+  if (%{$fixedPrimerWindows_r}) {
+    my $win_F3    = $fixedPrimerWindows_r->{"F3"}    // [0, 999_999];
+    my $win_B3    = $fixedPrimerWindows_r->{"B3"}    // [0, 999_999];
+    my $win_F2    = $fixedPrimerWindows_r->{"F2"}    // [0, 999_999];
+    my $win_B2    = $fixedPrimerWindows_r->{"B2"}    // [0, 999_999];
+    my $win_F1C   = $fixedPrimerWindows_r->{"F1C"}   // [0, 999_999];
+    my $win_B1C   = $fixedPrimerWindows_r->{"B1C"}   // [0, 999_999];
+    my $win_FLOOP = $fixedPrimerWindows_r->{"FLOOP"} // [0, 999_999];
+    my $win_BLOOP = $fixedPrimerWindows_r->{"BLOOP"} // [0, 999_999];
+
+    my $before_fwd_outer  = scalar(@outerForwardPrimers);
+    my $before_rev_outer  = scalar(@outerReversePrimers);
+    my $before_fwd_middle = scalar(@middleForwardPrimers);
+    my $before_rev_middle = scalar(@middleReversePrimers);
+    my $before_fwd_inner  = scalar(@innerForwardPrimers);
+    my $before_rev_inner  = scalar(@innerReversePrimers);
+    my $before_floop      = scalar(@loopForwardPrimers);
+    my $before_bloop      = scalar(@loopBackPrimers);
+
+    @outerForwardPrimers  = grep { $_->location() >= $win_F3->[0]    && $_->location() <= $win_F3->[1]    } @outerForwardPrimers;
+    @outerReversePrimers  = grep { $_->location() >= $win_B3->[0]    && $_->location() <= $win_B3->[1]    } @outerReversePrimers;
+    @middleForwardPrimers = grep { $_->location() >= $win_F2->[0]    && $_->location() <= $win_F2->[1]    } @middleForwardPrimers;
+    @middleReversePrimers = grep { $_->location() >= $win_B2->[0]    && $_->location() <= $win_B2->[1]    } @middleReversePrimers;
+    @innerForwardPrimers  = grep { $_->location() >= $win_F1C->[0]   && $_->location() <= $win_F1C->[1]   } @innerForwardPrimers;
+    @innerReversePrimers  = grep { $_->location() >= $win_B1C->[0]   && $_->location() <= $win_B1C->[1]   } @innerReversePrimers;
+    @loopForwardPrimers   = grep { $_->location() >= $win_FLOOP->[0] && $_->location() <= $win_FLOOP->[1] } @loopForwardPrimers;
+    @loopBackPrimers      = grep { $_->location() >= $win_BLOOP->[0] && $_->location() <= $win_BLOOP->[1] } @loopBackPrimers;
+
+    printf("[FIXED PRIMER WINDOW] Filtrage LOOP terminé / LOOP filtering done:\n");
+    printf("  F3:    %d -> %d | B3:    %d -> %d\n", $before_fwd_outer,  scalar(@outerForwardPrimers),
+                                                     $before_rev_outer,  scalar(@outerReversePrimers));
+    printf("  F2:    %d -> %d | B2:    %d -> %d\n", $before_fwd_middle, scalar(@middleForwardPrimers),
+                                                     $before_rev_middle, scalar(@middleReversePrimers));
+    printf("  F1:   %d -> %d | B1:   %d -> %d\n", $before_fwd_inner,  scalar(@innerForwardPrimers),
+                                                     $before_rev_inner,  scalar(@innerReversePrimers));
+    printf("  FLOOP: %d -> %d | BLOOP: %d -> %d\n", $before_floop, scalar(@loopForwardPrimers),
+                                                     $before_bloop, scalar(@loopBackPrimers));
+  }
+
+  # --- INJECTION DES AMORCES FIXEES dans les pools correspondants ---
+
+  # --- INJECT FIXED PRIMERS into the corresponding pools ---
+  if (@fixedPrimerSpecs) {
+    print "\n=== Injection des amorces fixees / Fixed Primer Injection ===\n";
+    my %target_tms = (
+      "F3" => $outerPrimerTargetTM, "B3" => $outerPrimerTargetTM,
+      "F2" => $middlePrimerTargetTM, "B2" => $middlePrimerTargetTM,
+      "F1C" => $innerPrimerTargetTM, "B1C" => $innerPrimerTargetTM,
+      "FLOOP" => $loopPrimerTargetTM, "BLOOP" => $loopPrimerTargetTM
+    );
+    
+    my $fixed_results_r = injectFixedPrimers(
+      $inputMSA, \@fixedPrimerSpecs,
+      $primerMinMatchPercent, $primerIupacMinPercent, $minPrimerCoverage,
+      $maxTotalDegen, $maxConsecDegen, $max3PrimeDegen,
+      $maxToleratedMismatches, $threePrimeZoneSize, $minBaseFrequency,
+      $options{"fixed_primer_optimize"},
+      \%target_tms,
+      $options_r
+    );
+    # Fusionner les amorces fixees dans chaque pool / Merge fixed primers into each pool
+    unshift @outerForwardPrimers,  @{ $fixed_results_r->{"F3"}    // [] };
+    unshift @outerReversePrimers,  @{ $fixed_results_r->{"B3"}    // [] };
+    unshift @middleForwardPrimers, @{ $fixed_results_r->{"F2"}    // [] };
+    unshift @middleReversePrimers, @{ $fixed_results_r->{"B2"}    // [] };
+    unshift @innerForwardPrimers,  @{ $fixed_results_r->{"F1C"}   // [] };
+    unshift @innerReversePrimers,  @{ $fixed_results_r->{"B1C"}   // [] };
+    unshift @loopForwardPrimers,   @{ $fixed_results_r->{"FLOOP"} // [] };
+    unshift @loopBackPrimers,      @{ $fixed_results_r->{"BLOOP"} // [] };
+    print "=== Injection terminee / Fixed Primer Injection done ===\n\n";
+  }
+
 
   print "Analyzing outer forward primers\n";
   my $outerForwardPrimerMeasurements_r =
@@ -1120,7 +1233,7 @@ sub getOligosWithMismatchTolerance {
     $loopBackPrimerMeasurements_r =
     analyzeAll(\@loopBackPrimers, $loopPrimerAnalyzer);
   } else {
-    print "Analyse de / Analysis ofs loop primers ignorée\n";
+    print "Analyse / Analysis of loop primers ignorée\n";
   }
 
   print "Analyzing middle forward primers\n";
@@ -1148,23 +1261,23 @@ sub getOligosWithMismatchTolerance {
   # Outer primers sorted 2 ways
   my @outerForwardInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$outerForwardPrimerMeasurements_r};
   my @outerReverseInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$outerReversePrimerMeasurements_r};
 
   my @outerForwardInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$outerForwardPrimerMeasurements_r};
   my @outerReverseInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$outerReversePrimerMeasurements_r};
 
@@ -1177,23 +1290,23 @@ sub getOligosWithMismatchTolerance {
   if($includeLoopPrimers) {
     @loopForwardInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$loopForwardPrimerMeasurements_r};
     @loopBackInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$loopBackPrimerMeasurements_r};
 
     @loopForwardInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$loopForwardPrimerMeasurements_r};
     @loopBackInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$loopBackPrimerMeasurements_r};
   }
@@ -1201,46 +1314,46 @@ sub getOligosWithMismatchTolerance {
   # Middle primers sorted 2 ways
   my @middleForwardInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$middleForwardPrimerMeasurements_r};
   my @middleReverseInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$middleReversePrimerMeasurements_r};
 
   my @middleForwardInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$middleForwardPrimerMeasurements_r};
   my @middleReverseInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$middleReversePrimerMeasurements_r};
 
   # Inner primers sorted 2 ways
   my @innerForwardInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$innerForwardPrimerMeasurements_r};
   my @innerReverseInfoByLocation =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getLocation()] } 
     @{$innerReversePrimerMeasurements_r};
 
   my @innerForwardInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$innerForwardPrimerMeasurements_r};
   my @innerReverseInfoByPenalty =
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1]}
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getLocation() <=> $b->[0]->getLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getSequence() cmp $b->[0]->getSequence() }
     map {[$_, $_->getPenalty()] } 
     @{$innerReversePrimerMeasurements_r};
 
@@ -1318,34 +1431,49 @@ sub getOligosWithMismatchTolerance {
   #-----------------------------------------------------------------------------
   # 2. PRE-COMPUTE PENALTIES (Sigmoid)
   #-----------------------------------------------------------------------------
-  # Pre-compute a set of distance penalties for faster use using the stored geometry
-  # GENERATION PROPORTIONNELLE SIGMOÏDE (LAVA 2026)
-  my $geometry = calculate_proportional_geometry($totalSignatureLength);
-  
-  # Pour Inner->Loop et Loop->Middle, cible 50% de F2-F1 chacun (répartition équilibrée) / For Inner->Loop and Loop->Middle, target 50% of F2-F1 each (balanced distribution)
-  my $loop_target = int($geometry->{'f2_f1_target'} / 2);
-  
-  print "Generating Sigmoid Penalties (Core.pm)...\n";
-  # Note: generateSigmoidPenalty is now used inside the loop or via pre-computed table
-  # But the old `generateDistancePenalties` used a parabolic model. 
-  # We will use the new `generateDistancePenalties` from Core which SHOULD be using sigmoid if updated,
-  # OR we call `generateSigmoidPenalty` directly.
-  # Let's assume generateDistancePenalties determines the penalty for array lookup. 
-  # CHECK: Does generateDistancePenalties use the new sigmoid? 
-  # Core.pm showed `generateDistancePenalties` calls `generateSigmoidPenalty` or `generatePenalty`.
-  # Let's verify Core.pm briefly if needed. (Assuming it does based on previous interactions).
-  
-  my $innerToLoopPenalties_r = generateDistancePenalties($signatureMaxLength, $loop_target, $penaltyPlateau, $penaltySlope);
-  my $loopToMiddlePenalties_r = generateDistancePenalties($signatureMaxLength, $loop_target, $penaltyPlateau, $penaltySlope);
-  
-  # Pour Middle->Outer (F2-F3), cible 12%
-  my $middleToOuterPenalties_r = generateDistancePenalties($signatureMaxLength, $geometry->{'f3_f2_target'}, $penaltyPlateau, $penaltySlope);
-  
-  # Pour Inner->Middle (sans loop), cible 18% (F1-F2)
-  my $innerToMiddlePenalties_r = generateDistancePenalties($signatureMaxLength, $geometry->{'f2_f1_target'}, $penaltyPlateau, $penaltySlope);
+  # Helper pour calculer la pente empirique / Helper to calculate empiric slope
+  sub get_k_slope {
+      my ($free, $sat, $name) = @_;
+      if ($sat <= $free) {
+          die "FATAL: La saturation ($sat) pour $name doit être strictement supérieure au seuil de gratuité ($free).
+";
+      }
+      return 4.6 / ($sat - $free);
+  }
 
-  # Pour Inner->Inner (F1c-B1c), cible 40%
-  my $innerToInnerPenalties_r = generateDistancePenalties($signatureMaxLength, $geometry->{'inner_target'}, $penaltyPlateau, $penaltySlope);
+  print "Generating Distance Penalties (Empiric Absolute)...
+";
+  
+  my $spacing_mo_free = optionWithDefault($options_r, "spacing_middle_outer_free", $optionDefaults{"spacing_middle_outer_free"});
+  my $spacing_mo_sat = optionWithDefault($options_r, "spacing_middle_outer_saturation", $optionDefaults{"spacing_middle_outer_saturation"});
+  my $k_mo = get_k_slope($spacing_mo_free, $spacing_mo_sat, "middleToOuter");
+  my $middleToOuterPenalties_r = generateDistancePenalties($signatureMaxLength, $spacing_mo_free, $k_mo);
+
+  my $spacing_im_free = optionWithDefault($options_r, "spacing_inner_middle_free", $optionDefaults{"spacing_inner_middle_free"});
+  my $spacing_im_sat = optionWithDefault($options_r, "spacing_inner_middle_saturation", $optionDefaults{"spacing_inner_middle_saturation"});
+  my $k_im = get_k_slope($spacing_im_free, $spacing_im_sat, "innerToMiddle");
+  my $innerToMiddlePenalties_r = generateDistancePenalties($signatureMaxLength, $spacing_im_free, $k_im);
+
+  my $spacing_ii_free = optionWithDefault($options_r, "spacing_inner_inner_free", $optionDefaults{"spacing_inner_inner_free"});
+  my $spacing_ii_sat = optionWithDefault($options_r, "spacing_inner_inner_saturation", $optionDefaults{"spacing_inner_inner_saturation"});
+  my $k_ii = get_k_slope($spacing_ii_free, $spacing_ii_sat, "innerToInner");
+  my $innerToInnerPenalties_r = generateDistancePenalties($signatureMaxLength, $spacing_ii_free, $k_ii);
+
+  my $innerToLoopPenalties_r = [];
+  my $loopToMiddlePenalties_r = [];
+  if ($includeLoopPrimers) {
+      my $spacing_il_free = optionWithDefault($options_r, "spacing_inner_loop_free", $optionDefaults{"spacing_inner_loop_free"});
+      my $spacing_il_sat = optionWithDefault($options_r, "spacing_inner_loop_saturation", $optionDefaults{"spacing_inner_loop_saturation"});
+      my $k_il = get_k_slope($spacing_il_free, $spacing_il_sat, "innerToLoop");
+      $innerToLoopPenalties_r = generateDistancePenalties($signatureMaxLength, $spacing_il_free, $k_il);
+      
+      my $spacing_lm_free = optionWithDefault($options_r, "spacing_loop_middle_free", $optionDefaults{"spacing_loop_middle_free"});
+      my $spacing_lm_sat = optionWithDefault($options_r, "spacing_loop_middle_saturation", $optionDefaults{"spacing_loop_middle_saturation"});
+      my $k_lm = get_k_slope($spacing_lm_free, $spacing_lm_sat, "loopToMiddle");
+      $loopToMiddlePenalties_r = generateDistancePenalties($signatureMaxLength, $spacing_lm_free, $k_lm);
+  }
+
+
 
   #-----------------------------------------------------------------------------
   # 3. OPTIMIZED NESTED LOOPS (Forward)
@@ -1388,202 +1516,425 @@ sub getOligosWithMismatchTolerance {
 
   my $innerForwardCount = scalar(@{$masterInnerF_r});
   # Barre de progression pour la recherche combinatoire Forward / Progress bar for Forward combinatorial search
+  
+  # --- B&B Initialization Forward ---
+  my $min_val_f = sub { my $m = $_[0]; for(@_) { $m = $_ if $_ < $m } return $m; };
+  my $minS_innerToLoop_F = @$innerToLoopPenalties_r ? $min_val_f->(@$innerToLoopPenalties_r) * $innerToLoopPenaltyWeight : 0;
+  my $minS_loopToMiddle_F = @$loopToMiddlePenalties_r ? $min_val_f->(@$loopToMiddlePenalties_r) * $loopToMiddlePenaltyWeight : 0;
+  my $minS_middleToOuter_F = @$middleToOuterPenalties_r ? $min_val_f->(@$middleToOuterPenalties_r) * $middleToOuterPenaltyWeight : 0;
+  my $minS_innerToMiddle_F = @$innerToMiddlePenalties_r ? $min_val_f->(@$innerToMiddlePenalties_r) * $innerToMiddlePenaltyWeight : 0;
+  my $rmq_middle_f = build_rmq($masterMiddleF_data_r, 2);
+  my $rmq_outer_f  = build_rmq($masterOuterF_data_r, 2);
+  my $rmq_loop_f   = build_rmq($masterLoopF_data_r, 2) if $includeLoopPrimers;
+  my $min_P_outer_F = @$masterOuterF_data_r ? query_rmq($rmq_outer_f, 0, scalar(@$masterOuterF_data_r)-1) * $outerPenaltyWeight : 0;
+  
+  my $_sig_fwd_pruned = 0;
+  my $_sig_fwd_evaluated = 0;
+  # --- Counters for zero-signature diagnostic ---
+  my $_fwd_rej_geometry = 0;
+  my $_fwd_rej_spacing = 0;
+  my $_fwd_rej_loopgap = 0;
+  my $_fwd_rej_tm_inner_loop = 0;
+  my $_fwd_rej_tm_loop_middle = 0;
+  my $_fwd_rej_tm_inner_middle = 0;
+  my $_fwd_rej_tm_middle_outer = 0;
+  my $_fwd_min_delta_tm_inner_loop = 999;
+  my $_fwd_min_delta_tm_loop_middle = 999;
+  my $_fwd_min_delta_tm_inner_middle = 999;
+  my $_fwd_min_delta_tm_middle_outer = 999;
+  my $_fwd_min_span_needed = 999999;
+  
+  my %_fwd_pen_guards;
+  my $fwd_prog_dir = "$options_r->{'output_file'}_fwd_prog_$$";
+  $fwd_prog_dir = "$options_r->{'output_file'}_fwd_prog_$$" if ref($options_r);
+  use File::Path qw(make_path remove_tree);
+  remove_tree($fwd_prog_dir) if -d $fwd_prog_dir;
+  make_path($fwd_prog_dir);
   my $_sig_fwd_t0   = time();
   my $_sig_fwd_done = 0;
   my $_sig_fwd_hits = 0;  # Nombre de signatures Forward trouvees / Forward signatures found
-  print STDERR "  Recherche combinatoire Forward: $innerForwardCount amorces F1c...\n";
+  my $pm_fwd = LLNL::LAVA::ForkManager->new($options_r->{"threads"});
+  my $num_fwd_chunks = $pm_fwd->{max_processes} * 12;
+  $num_fwd_chunks = 30 if $num_fwd_chunks < 30;
+  $num_fwd_chunks = $innerForwardCount if $num_fwd_chunks > $innerForwardCount;
+  $num_fwd_chunks = 1 if $num_fwd_chunks < 1;
+  my $fwd_chunk_size = int(($innerForwardCount + $num_fwd_chunks - 1) / $num_fwd_chunks);
+  $fwd_chunk_size = 1 if $fwd_chunk_size < 1;
 
-  for(my $innerIndex = 0; $innerIndex < $innerForwardCount; $innerIndex++)
-  {
-      # Barre de progression toutes les 50 iterations ou a 100%
-      # Progress bar every 50 iterations or at 100%
-      $_sig_fwd_done = $innerIndex + 1;
-      if ($_sig_fwd_done % 50 == 0 || $_sig_fwd_done == $innerForwardCount) {
-        # Emission progression Flask / Flask progress emission
-        if ($_LAVA_IS_TTY || 1) {  # Toujours emettre pour Flask / Always emit for Flask
-          my $elapsed = time() - $_sig_fwd_t0 + 0.001;
-          my $eta = ($_sig_fwd_done < $innerForwardCount)
-                    ? int(($innerForwardCount - $_sig_fwd_done) / ($_sig_fwd_done / $elapsed))
-                    : 0;
-          my $rate = $_sig_fwd_done / $elapsed;
-          printf("[LAVA-PROGRESS] Signatures Forward|%d|%d|Sig: %d|%.1f it/s|%d\n",
-                 $_sig_fwd_done, $innerForwardCount, $_sig_fwd_hits, $rate, $eta);
-        }
+  $pm_fwd->run_on_finish(sub {
+      my ($pid, $exit_code, $id, $exit_signal, $core_dump, $data_ref) = @_;
+      if (defined $data_ref && ref($data_ref) eq 'HASH') {
+          foreach my $idx (sort { $a <=> $b } keys %{$data_ref->{infos}}) {
+              if (!defined $bestForwardInfos[$idx]) {
+                  $forwardSetCount++;
+              }
+              $bestForwardInfos[$idx] = $data_ref->{infos}->{$idx};
+              $bestForwardPenalties[$idx] = $data_ref->{penalties}->{$idx};
+          }
+          $_sig_fwd_hits += $data_ref->{hits} || 0;
+          $_sig_fwd_done += $data_ref->{done} || 0;
+          $_sig_fwd_pruned += $data_ref->{pruned} || 0;
+          $_sig_fwd_evaluated += $data_ref->{evaluated} || 0;
+          
+          $_fwd_rej_geometry += $data_ref->{rej_geometry} || 0;
+          $_fwd_rej_spacing += $data_ref->{rej_spacing} || 0;
+          $_fwd_rej_loopgap += $data_ref->{rej_loopgap} || 0;
+          $_fwd_rej_tm_inner_loop += $data_ref->{rej_tm_inner_loop} || 0;
+          $_fwd_rej_tm_loop_middle += $data_ref->{rej_tm_loop_middle} || 0;
+          $_fwd_rej_tm_inner_middle += $data_ref->{rej_tm_inner_middle} || 0;
+          $_fwd_rej_tm_middle_outer += $data_ref->{rej_tm_middle_outer} || 0;
+          
+          foreach my $k (qw(min_tm_inner_loop min_tm_loop_middle min_tm_inner_middle min_tm_middle_outer min_span_needed)) {
+              next unless defined $data_ref->{$k};
+              if ($k eq 'min_tm_inner_loop') {
+                  $_fwd_min_delta_tm_inner_loop = $data_ref->{$k} if $data_ref->{$k} < $_fwd_min_delta_tm_inner_loop;
+              } elsif ($k eq 'min_tm_loop_middle') {
+                  $_fwd_min_delta_tm_loop_middle = $data_ref->{$k} if $data_ref->{$k} < $_fwd_min_delta_tm_loop_middle;
+              } elsif ($k eq 'min_tm_inner_middle') {
+                  $_fwd_min_delta_tm_inner_middle = $data_ref->{$k} if $data_ref->{$k} < $_fwd_min_delta_tm_inner_middle;
+              } elsif ($k eq 'min_tm_middle_outer') {
+                  $_fwd_min_delta_tm_middle_outer = $data_ref->{$k} if $data_ref->{$k} < $_fwd_min_delta_tm_middle_outer;
+              } elsif ($k eq 'min_span_needed') {
+                  $_fwd_min_span_needed = $data_ref->{$k} if $data_ref->{$k} < $_fwd_min_span_needed;
+              }
+          }
+          foreach my $k (qw(innerToLoop loopToMiddle innerToMiddle middleToOuter)) {
+              $_fwd_pen_guards{"${k}_neg"} += $data_ref->{pen_guards}->{"${k}_neg"} || 0;
+              $_fwd_pen_guards{"${k}_oob"} += $data_ref->{pen_guards}->{"${k}_oob"} || 0;
+          }
       }
-      my $innerInfo = $masterInnerF_r->[$innerIndex];
-      my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerF_data_r->[$innerIndex]};
-      
-      my $bestSetPenalty = 1000000;
-      
-      # 3.1 Calculate Search Bounds for Loop Primer
-      my $searchStartAt = $innerLocation - $signatureMaxLength + $innerLength + 20;
-      $searchStartAt = 0 if $searchStartAt < 0;
-      
-      my $loopEndAt = $innerLocation - 1 - $minPrimerSpacing;
-      $loopEndAt = 0 if $loopEndAt < 0;
-      
-      # Determine Loop List to iterate
-      my $currentLoopList_r = $includeLoopPrimers ? $masterLoopF_r : $masterLoopF_r; # Placeholder logic if false
-      my $currentLoopData_r = $includeLoopPrimers ? $masterLoopF_data_r : $masterLoopF_data_r;
-      my $loopCount = scalar(@{$currentLoopList_r});
-      
-      # If NO loops, we update the placeholder location to be valid (end of range)
-      if (!$includeLoopPrimers) {
-           $currentLoopData_r->[0]->[0] = $loopEndAt + 1; # Dummy valid location
-      }
+  });
 
-      for(my $i = 0; $i < $loopCount; $i++)
+  for (my $chunk_id = 0; $chunk_id < $num_fwd_chunks; $chunk_id++) {
+      $pm_fwd->start($chunk_id) and next;
+      
+      my %chunk_infos = ();
+      my %chunk_penalties = ();
+      my $chunk_hits = 0;
+      my $chunk_done = 0;
+      my $chunk_pruned = 0;
+      my $chunk_evaluated = 0;
+      my $chunk_rej_geometry = 0;
+      my $chunk_rej_spacing = 0;
+      my $chunk_rej_loopgap = 0;
+      my $chunk_rej_tm_inner_loop = 0;
+      my $chunk_rej_tm_loop_middle = 0;
+      my $chunk_rej_tm_inner_middle = 0;
+      my $chunk_rej_tm_middle_outer = 0;
+      my $chunk_min_delta_tm_inner_loop = 999;
+      my $chunk_min_delta_tm_loop_middle = 999;
+      my $chunk_min_delta_tm_inner_middle = 999;
+      my $chunk_min_delta_tm_middle_outer = 999;
+      my $chunk_min_span_needed = 999999;
+
+      
+      for(my $innerIndex = $chunk_id; $innerIndex < $innerForwardCount; $innerIndex += $num_fwd_chunks)
       {
-          my $loopInfo = $currentLoopList_r->[$i];
-          my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
+          $chunk_done++;
+          my $innerInfo = $masterInnerF_r->[$innerIndex];
+          my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerF_data_r->[$innerIndex]};
           
-          if ($includeLoopPrimers) {
-              # Fast-Fail: Sorted by location.
-              # If loop is before search window, skip.
-              next if ($loopLocation < $searchStartAt);
-              
-              # Fast-Fail: If loop is beyond search window, STOP.
-              last if ($loopLocation > $loopEndAt);
+          my $bestSetPenalty = 1000000;
+          
+          # 3.1 Calculate Search Bounds for Loop Primer
+          my $searchStartAt = $innerLocation - $signatureMaxLength + $innerLength + 20;
+          $searchStartAt = 0 if $searchStartAt < 0;
+          
+          my $loopEndAt = $innerLocation - 1 - $minPrimerSpacing;
+          $loopEndAt = 0 if $loopEndAt < 0;
+          
+          # Determine Loop List to iterate
+          my $currentLoopList_r = $includeLoopPrimers ? $masterLoopF_r : $masterLoopF_r; # Placeholder logic if false
+          my $currentLoopData_r = $includeLoopPrimers ? $masterLoopF_data_r : $masterLoopF_data_r;
+          my $loopCount = scalar(@{$currentLoopList_r});
+          
+          # If NO loops, we update the placeholder location to be valid (end of range)
+          if (!$includeLoopPrimers) {
+               $currentLoopData_r->[0]->[0] = $loopEndAt + 1; # Dummy valid location
+          }
 
-              # --- DYNAMIC THERMAL FILTER (Inner vs Loop) ---
-              next if (abs($innerTm - $loopTm) > $maxTmDiff);
-          }
-          
-          # 3.2 Calculate Search Bounds for Middle Primer (F2) (Structure: F3-F2-LF-F1c)
-          # Middle (F2) is upstream of Loop.
-          my $middleStartAt = $searchStartAt; # Inherit max range start
-          my $middleEndAt = $loopLocation - $loopLength - $minPrimerSpacing;
-          
-          # Ensure Middle isn't too close to Inner (respecting loop gap or standard gap)
-          if ($includeLoopPrimers) {
-              my $altMiddleEndAt = $innerLocation - ($loopMinGap + 1);
-              $middleEndAt = $altMiddleEndAt if ($altMiddleEndAt < $middleEndAt);
-          } else {
-              my $altMiddleEndAt = $innerLocation - $minPrimerSpacing;
-              $middleEndAt = $altMiddleEndAt if ($altMiddleEndAt < $middleEndAt);
-          }
-          $middleEndAt = 0 if $middleEndAt < 0;
-          
-          my $innerToLoopDistance = $innerLocation - ($loopLocation + 1);
-          
-          my $middleCount = scalar(@{$masterMiddleF_r});
-          for(my $j = 0; $j < $middleCount; $j++)
+          for(my $i = 0; $i < $loopCount; $i++)
           {
-              my $middleInfo = $masterMiddleF_r->[$j];
-              my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleF_data_r->[$j]};
+              my $loopInfo = $currentLoopList_r->[$i];
+              my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
               
-              # Fast-Fail
-              next if ($middleLocation < $middleStartAt);
-              last if ($middleLocation > $middleEndAt);
-              
-              # Validity Checks (Redundant with bounds but safe)
               if ($includeLoopPrimers) {
-                  next if ($middleLocation + $middleLength + $minPrimerSpacing > $loopLocation - $loopLength + 1);
-                  next if ($middleLocation + $middleLength + $loopMinGap > $innerLocation);
-              }
+                  # Fast-Fail: Sorted by location.
+                  if ($loopLocation < $searchStartAt) { $chunk_rej_geometry++; next; }
+                  last if ($loopLocation > $loopEndAt);
 
-              # --- DYNAMIC THERMAL FILTER (Neighbor Check) ---
+                  # --- DYNAMIC THERMAL FILTER (Inner vs Loop) ---
+                  my $diff = abs($innerTm - $loopTm);
+                  if ($diff > $maxTmDiff && !($innerInfo->hasTag("is_fixed") || $loopInfo->hasTag("is_fixed"))) {
+                      $chunk_min_delta_tm_inner_loop = $diff if $diff < $chunk_min_delta_tm_inner_loop;
+                      $chunk_rej_tm_inner_loop++;
+                      next;
+                  }
+              }
+              
+              # 3.2 Calculate Search Bounds for Middle Primer (F2) (Structure: F3-F2-LF-F1c)
+              my $middleStartAt = $searchStartAt;
+              my $middleEndAt = $loopLocation - $loopLength - $minPrimerSpacing + $middlePrimerMaxLength - 1;
+              
+              # Ensure Middle isn't too close to Inner (respecting loop gap or standard gap)
+              # [restauré depuis a6098f5 : le refactor 55328b2 avait supprime cette contrainte]
               if ($includeLoopPrimers) {
-                  # Loop vs Middle
-                  next if (abs($loopTm - $midTm) > $maxTmDiff);
+                  my $altMiddleEndAt = $innerLocation - ($loopMinGap + 1);
+                  $middleEndAt = $altMiddleEndAt if ($altMiddleEndAt < $middleEndAt);
               } else {
-                  # Inner vs Middle (if no loop)
-                  next if (abs($innerTm - $midTm) > $maxTmDiff);
+                  my $altMiddleEndAt = $innerLocation - $minPrimerSpacing;
+                  $middleEndAt = $altMiddleEndAt if ($altMiddleEndAt < $middleEndAt);
+              }
+              $middleEndAt = 0 if $middleEndAt < 0;
+              
+              my $innerToLoopDistance = $innerLocation - ($loopLocation + 1);
+              
+              
+              my $m_start = binary_search_first_ge($masterMiddleF_data_r, $middleStartAt);
+              my $m_end = binary_search_last_le($masterMiddleF_data_r, $middleEndAt);
+              if ($m_start != -1 && $m_end != -1 && $m_start <= $m_end) {
+                  my $min_P_mid_range = query_rmq($rmq_middle_f, $m_start, $m_end) * $middlePenaltyWeight;
+                  my $innerToLoopDistance = $includeLoopPrimers ? $innerLocation - ($loopLocation + 1) : 0;
+                  
+                  my $pen_innerToLoop = penaltyAt($innerToLoopPenalties_r, $innerToLoopDistance, 'innerToLoop');
+                  if ($pen_innerToLoop < 0) { $penalty_guard_innerToLoop_neg++; }
+                  if ($pen_innerToLoop == 9999) { $penalty_guard_innerToLoop_oob++; }
+                  
+                  my $base_penalty = ($innerPenalty * $innerPenaltyWeight) + 
+                                     ($includeLoopPrimers ? $loopPenalty * $loopPenaltyWeight : 0) + 
+                                     ($includeLoopPrimers ? $pen_innerToLoop * $innerToLoopPenaltyWeight : 0);
+                  my $min_S_to_mid = $includeLoopPrimers ? $minS_loopToMiddle_F : $minS_innerToMiddle_F;
+                  
+                  if ($base_penalty + $min_P_mid_range + $min_P_outer_F + $min_S_to_mid + $minS_middleToOuter_F >= $bestSetPenalty) {
+                      $chunk_pruned += ($m_end - $m_start + 1);
+                  } else {
+                      for(my $j = $m_start; $j <= $m_end; $j++)
+                      {
+                          my $middleInfo = $masterMiddleF_r->[$j];
+                          my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleF_data_r->[$j]};
+                          
+                          if ($includeLoopPrimers) {
+                              my $loopToMiddleDistance = ($loopLocation - $loopLength + 1) - ($middleLocation + $middleLength);
+                              if ($loopToMiddleDistance < 0) {
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              my $needed = $minPrimerSpacing - $loopToMiddleDistance;
+                              if ($needed > 0) {
+                                  my $span = ($innerLocation + $innerLength) - $middleLocation + $needed;
+                                  $chunk_min_span_needed = $span if $span < $chunk_min_span_needed;
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              if ($middleLocation + $middleLength + $loopMinGap > $innerLocation) { $chunk_rej_loopgap++; next; }
+                              my $diffLM = abs($loopTm - $midTm);
+                              if ($diffLM > $maxTmDiff && !($loopInfo->hasTag("is_fixed") || $middleInfo->hasTag("is_fixed"))) {
+                                  $chunk_min_delta_tm_loop_middle = $diffLM if $diffLM < $chunk_min_delta_tm_loop_middle;
+                                  $chunk_rej_tm_loop_middle++;
+                                  next;
+                              }
+                          } else {
+                              my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
+                              if ($innerToMiddleDistance < 0) {
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              my $needed = $minPrimerSpacing - $innerToMiddleDistance;
+                              if ($needed > 0) {
+                                  my $span = ($innerLocation + $innerLength) - $middleLocation + $needed;
+                                  $chunk_min_span_needed = $span if $span < $chunk_min_span_needed;
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              my $diffIM = abs($innerTm - $midTm);
+                              if ($diffIM > $maxTmDiff && !($innerInfo->hasTag("is_fixed") || $middleInfo->hasTag("is_fixed"))) {
+                                  $chunk_min_delta_tm_inner_middle = $diffIM if $diffIM < $chunk_min_delta_tm_inner_middle;
+                                  $chunk_rej_tm_inner_middle++;
+                                  next;
+                              }
+                          }
+                          
+                          my $outerStartAt = $searchStartAt;
+                          my $outerEndAt = $middleLocation - 1 - $minPrimerSpacing + $outerPrimerMaxLength;
+                          my $loopToMiddleDistance = $includeLoopPrimers ? ($loopLocation - $loopLength + 1) - ($middleLocation + $middleLength) : 0;
+                          my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
+                          
+                          my $o_start = binary_search_first_ge($masterOuterF_data_r, $outerStartAt);
+                          my $o_end = binary_search_last_le($masterOuterF_data_r, $outerEndAt);
+                          if ($o_start != -1 && $o_end != -1 && $o_start <= $o_end) {
+                              my $min_P_out_range = query_rmq($rmq_outer_f, $o_start, $o_end) * $outerPenaltyWeight;
+                              
+                              my $pen_mid = $includeLoopPrimers ? penaltyAt($loopToMiddlePenalties_r, $loopToMiddleDistance, 'loopToMiddle') : penaltyAt($innerToMiddlePenalties_r, $innerToMiddleDistance, 'innerToMiddle');
+                              if ($pen_mid < 0) { if($includeLoopPrimers) { $penalty_guard_loopToMiddle_neg++; } else { $penalty_guard_innerToMiddle_neg++; } }
+                              if ($pen_mid == 9999) { if($includeLoopPrimers) { $penalty_guard_loopToMiddle_oob++; } else { $penalty_guard_innerToMiddle_oob++; } }
+
+                              my $part_penalty = $base_penalty + ($middlePenalty * $middlePenaltyWeight) + 
+                                                 ($pen_mid * ($includeLoopPrimers ? $loopToMiddlePenaltyWeight : $innerToMiddlePenaltyWeight));
+                              
+                              if ($part_penalty + $min_P_out_range + $minS_middleToOuter_F >= $bestSetPenalty) {
+                                  $chunk_pruned += ($o_end - $o_start + 1);
+                              } else {
+                                  for(my $k = $o_start; $k <= $o_end; $k++)
+                                  {
+                                      $chunk_evaluated++;
+                                      my $outerInfo = $masterOuterF_r->[$k];
+                                      my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterF_data_r->[$k]};
+                                      
+                                      my $middleToOuterDistance = $middleLocation - ($outerLocation + $outerLength);
+                                      if ($middleToOuterDistance < 0) {
+                                          $chunk_rej_spacing++;
+                                          next;
+                                      }
+                                      my $needed = $minPrimerSpacing - $middleToOuterDistance;
+                                      if ($needed > 0) {
+                                          my $span = ($innerLocation + $innerLength) - $outerLocation + $needed;
+                                          $chunk_min_span_needed = $span if $span < $chunk_min_span_needed;
+                                          $chunk_rej_spacing++;
+                                          next;
+                                      }
+                                      my $diffMO = abs($midTm - $outTm);
+                                      if ($diffMO > $maxTmDiff && !($middleInfo->hasTag("is_fixed") || $outerInfo->hasTag("is_fixed"))) {
+                                          $chunk_min_delta_tm_middle_outer = $diffMO if $diffMO < $chunk_min_delta_tm_middle_outer;
+                                          $chunk_rej_tm_middle_outer++;
+                                          next;
+                                      }
+                                      
+                                      my $pen_out = penaltyAt($middleToOuterPenalties_r, $middleToOuterDistance, 'middleToOuter');
+                                      if ($pen_out < 0) { $penalty_guard_middleToOuter_neg++; }
+                                      if ($pen_out == 9999) { $penalty_guard_middleToOuter_oob++; }
+                                      
+                                      my $spacingPenalty = ($includeLoopPrimers ? $pen_innerToLoop * $innerToLoopPenaltyWeight : 0) +
+                                                           ($pen_mid * ($includeLoopPrimers ? $loopToMiddlePenaltyWeight : $innerToMiddlePenaltyWeight)) +
+                                                           ($pen_out * $middleToOuterPenaltyWeight);
+                                      
+                                      my $primer3Penalty = $innerPenalty * $innerPenaltyWeight + ($includeLoopPrimers ? $loopPenalty * $loopPenaltyWeight : 0) + $middlePenalty * $middlePenaltyWeight + $outerPenalty * $outerPenaltyWeight;
+                                      
+                                      my $detailStr = "";
+                                      if ($includeLoopPrimers) {
+                                          $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
+                                                ($pen_innerToLoop * $innerToLoopPenaltyWeight), ($pen_mid * $loopToMiddlePenaltyWeight), ($pen_out * $middleToOuterPenaltyWeight),
+                                                ($innerPenalty * $innerPenaltyWeight), ($loopPenalty * $loopPenaltyWeight), ($middlePenalty * $middlePenaltyWeight), ($outerPenalty * $outerPenaltyWeight));
+                                      } else {
+                                          $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
+                                                ($pen_mid * $innerToMiddlePenaltyWeight), ($pen_out * $middleToOuterPenaltyWeight),
+                                                ($innerPenalty * $innerPenaltyWeight), ($middlePenalty * $middlePenaltyWeight), ($outerPenalty * $outerPenaltyWeight));
+                                      }
+                                      
+                                      my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
+                                      if ($currentSetPenalty < $bestSetPenalty) {
+                                          $chunk_hits++ unless exists $chunk_infos{$innerIndex};
+                                          $chunk_infos{$innerIndex} = $includeLoopPrimers ? [$loopInfo, $middleInfo, $outerInfo] : [$middleInfo, $outerInfo];
+                                          $chunk_penalties{$innerIndex} = [$spacingPenalty, $primer3Penalty, $detailStr];
+                                          $bestSetPenalty = $currentSetPenalty;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
 
-              # 3.3 Calculate Search Bounds for Outer Primer (F3)
-              my $outerStartAt = $searchStartAt;
-              my $outerEndAt = $middleLocation - 1 - $minPrimerSpacing;
-              
-              my $loopToMiddleDistance = ($loopLocation - $loopLength + 1) - ($middleLocation + $middleLength);
-              
-              my $outerCount = scalar(@{$masterOuterF_r});
-              for(my $k = 0; $k < $outerCount; $k++)
-              {
-                  my $outerInfo = $masterOuterF_r->[$k];
-                  my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterF_data_r->[$k]};
+          } # End Loop
+          
+          # Intra-chunk progress reporting
+          if ($chunk_done % 5 == 0) {
+              my $prog_file_me = "$fwd_prog_dir/chunk_$chunk_id.prog";
+              if (open(my $fh, '>', $prog_file_me)) {
+                  flock($fh, 2);
+                  print $fh "$chunk_done,$chunk_hits,$chunk_pruned,$chunk_evaluated\n";
+                  close($fh);
+              }
                   
-                  # Fast-Fail
-                  next if ($outerLocation < $outerStartAt);
-                  last if ($outerLocation > $outerEndAt);
-                  
-                  # Distance Check
-                  next if ($outerLocation + $outerLength + $minPrimerSpacing > $middleLocation);
-                  
-                  # --- DYNAMIC THERMAL FILTER (Middle vs Outer) ---
-                  next if (abs($midTm - $outTm) > $maxTmDiff);
-                  
-                  # Calculate Penalty
-                  my $middleToOuterDistance = $middleLocation - ($outerLocation + $outerLength);
-                  my $innerToMiddleDistance = $innerLocation - ($middleLocation + $middleLength);
-                  
-                  my $spacingPenalty = 0;
-                  my $primer3Penalty = 0;
-                  my $detailStr = "";
-                  
-                  if ($includeLoopPrimers) {
-                      # Ensure indices are within bounds of pre-computed arrays
-                      # (Assuming generateDistancePenalties covers $signatureMaxLength)
-                      $spacingPenalty = 
-                          ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight) +
-                          ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $loopPenalty * $loopPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
-                            ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight),
-                            ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($loopPenalty * $loopPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
-                  } else {
-                      $spacingPenalty = 
-                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
-                            ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
+              my $total_done = 0;
+              my $total_hits = 0;
+              foreach my $f (glob("$fwd_prog_dir/chunk_*.prog")) {
+                  if (open(my $r, '<', $f)) {
+                      my $line = <$r>; close($r);
+                      next unless defined $line;
+                      chomp $line;
+                      my ($d, $h) = split /,/, $line;
+                      $total_done += $d // 0;
+                      $total_hits += $h // 0;
                   }
-                  
-                  my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
-                  
-                  # Save if best
-                  if ($currentSetPenalty < $bestSetPenalty) {
-                      $bestForwardInfos[$innerIndex] = [$loopInfo, $middleInfo, $outerInfo];
-                      $bestSetPenalty = $currentSetPenalty;
-                      $bestForwardPenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
-                      $forwardSetCount++;
-                      $_sig_fwd_hits++;  # Compteur de signatures Forward / Forward signature counter
-                  }
-              } # End Outer
-          } # End Middle
-      } # End Loop
-  } # End Inner
+              }
+                      
+              if ($_LAVA_IS_TTY || 1) {
+                  my $elapsed = time() - $_sig_fwd_t0 + 0.001;
+                  my $eta = ($total_done < $innerForwardCount) ? int(($innerForwardCount - $total_done) / ($total_done / $elapsed)) : 0;
+                  my $rate = $total_done / $elapsed;
+                  printf("[LAVA-PROGRESS] Signatures Forward|%d|%d|Sig: %d|%.1f it/s|%d\r", $total_done, $innerForwardCount, $total_hits, $rate, $eta);
+                  my $old_h = select(STDOUT); $| = 1; select($old_h);
+              }
+          }
+} # End Inner chunk loop
+      
+      my $prog_file_me = "$fwd_prog_dir/chunk_$chunk_id.prog";
+      if (open(my $fh, '>', $prog_file_me)) { flock($fh, 2); print $fh "$chunk_done,$chunk_hits,$chunk_pruned,$chunk_evaluated\n"; close($fh); }
+      
+      $pm_fwd->finish(0, {
+          infos => \%chunk_infos,
+          penalties => \%chunk_penalties,
+          hits => $chunk_hits,
+          done => $chunk_done,
+          pruned => $chunk_pruned,
+          evaluated => $chunk_evaluated,
+          rej_geometry => $chunk_rej_geometry,
+          rej_spacing => $chunk_rej_spacing,
+          rej_loopgap => $chunk_rej_loopgap,
+          rej_tm_inner_loop => $chunk_rej_tm_inner_loop,
+          rej_tm_loop_middle => $chunk_rej_tm_loop_middle,
+          rej_tm_inner_middle => $chunk_rej_tm_inner_middle,
+          rej_tm_middle_outer => $chunk_rej_tm_middle_outer,
+          min_tm_inner_loop => $chunk_min_delta_tm_inner_loop,
+          min_tm_loop_middle => $chunk_min_delta_tm_loop_middle,
+          min_tm_inner_middle => $chunk_min_delta_tm_inner_middle,
+          min_tm_middle_outer => $chunk_min_delta_tm_middle_outer,
+          min_span_needed => $chunk_min_span_needed,
+          pen_guards => {
+              innerToLoop_neg => $penalty_guard_innerToLoop_neg,
+              innerToLoop_oob => $penalty_guard_innerToLoop_oob,
+              loopToMiddle_neg => $penalty_guard_loopToMiddle_neg,
+              loopToMiddle_oob => $penalty_guard_loopToMiddle_oob,
+              innerToMiddle_neg => $penalty_guard_innerToMiddle_neg,
+              innerToMiddle_oob => $penalty_guard_innerToMiddle_oob,
+              middleToOuter_neg => $penalty_guard_middleToOuter_neg,
+              middleToOuter_oob => $penalty_guard_middleToOuter_oob,
+          }
+      });
+  } # End chunks
+  $pm_fwd->wait_all_children();
+  use File::Path qw(remove_tree);
+  remove_tree($fwd_prog_dir) if -d $fwd_prog_dir;
+  
+  if ($_sig_fwd_pruned + $_sig_fwd_evaluated > 0) {
+      my $pct = ($_sig_fwd_pruned / ($_sig_fwd_pruned + $_sig_fwd_evaluated)) * 100;
+      print sprintf("    [Forward B&B] Elagage: %.2f%%\n", $pct);
+  }
+
+  my @guard_msgs = ();
+  foreach my $k (qw(innerToLoop loopToMiddle innerToMiddle middleToOuter)) {
+      if ($_fwd_pen_guards{"${k}_neg"}) {
+          push @guard_msgs, "$k(neg: $_fwd_pen_guards{\"${k}_neg\"})";
+      }
+      if ($_fwd_pen_guards{"${k}_oob"}) {
+          push @guard_msgs, "$k(oob: $_fwd_pen_guards{\"${k}_oob\"})";
+      }
+  }
+  if (@guard_msgs) {
+      print "    [PENALTY GUARD] Declenchements Forward : " . join(", ", @guard_msgs) . "\n";
+  }
+
   
   # Finaliser la barre Forward / Finalize Forward bar
-  print "  [Forward] $forwardSetCount combinaisons Forward trouvees sur $innerForwardCount amorces F1c.\n";
+  print "  [Forward] $forwardSetCount combinaisons Forward trouvees sur $innerForwardCount amorces F1.\n";
 
   # Check if anything found
-  if($forwardSetCount == 0) {
-      print "No valid forward primer combinations found.\n";
+  if ($forwardSetCount == 0) {
+      print_zero_signature_diagnostic(1, $innerForwardCount, scalar(@$masterOuterF_r),
+        $_fwd_rej_geometry, $_fwd_rej_spacing, $_fwd_rej_loopgap,
+        $_fwd_rej_tm_inner_loop, $_fwd_rej_tm_loop_middle, $_fwd_rej_tm_inner_middle, $_fwd_rej_tm_middle_outer,
+        $_fwd_min_delta_tm_inner_loop, $_fwd_min_delta_tm_loop_middle, $_fwd_min_delta_tm_inner_middle, $_fwd_min_delta_tm_middle_outer,
+        $_fwd_min_span_needed, $signatureMaxLength, $maxTmDiff, $options_r);
       exit 0;
   }
 
@@ -1619,391 +1970,783 @@ sub getOligosWithMismatchTolerance {
   
   my $innerReverseCount = scalar(@{$masterInnerR_r});
   # Barre de progression pour la recherche combinatoire Reverse / Progress bar for Reverse combinatorial search
+  
+  # --- B&B Initialization Reverse ---
+  my $minS_innerToLoop_R = @$innerToLoopPenalties_r ? $min_val_f->(@$innerToLoopPenalties_r) * $innerToLoopPenaltyWeight : 0;
+  my $minS_loopToMiddle_R = @$loopToMiddlePenalties_r ? $min_val_f->(@$loopToMiddlePenalties_r) * $loopToMiddlePenaltyWeight : 0;
+  my $minS_middleToOuter_R = @$middleToOuterPenalties_r ? $min_val_f->(@$middleToOuterPenalties_r) * $middleToOuterPenaltyWeight : 0;
+  my $minS_innerToMiddle_R = @$innerToMiddlePenalties_r ? $min_val_f->(@$innerToMiddlePenalties_r) * $innerToMiddlePenaltyWeight : 0;
+  my $rmq_middle_r = build_rmq($masterMiddleR_data_r, 2);
+  my $rmq_outer_r  = build_rmq($masterOuterR_data_r, 2);
+  my $rmq_loop_r   = build_rmq($masterLoopR_data_r, 2) if $includeLoopPrimers;
+  my $min_P_outer_R = @$masterOuterR_data_r ? query_rmq($rmq_outer_r, 0, scalar(@$masterOuterR_data_r)-1) * $outerPenaltyWeight : 0;
+  
+  my $_sig_rev_pruned = 0;
+  my $_sig_rev_evaluated = 0;
+  my $_rev_rej_geometry = 0;
+  my $_rev_rej_spacing = 0;
+  my $_rev_rej_loopgap = 0;
+  my $_rev_rej_tm_inner_loop = 0;
+  my $_rev_rej_tm_loop_middle = 0;
+  my $_rev_rej_tm_inner_middle = 0;
+  my $_rev_rej_tm_middle_outer = 0;
+  my $_rev_min_delta_tm_inner_loop = 999;
+  my $_rev_min_delta_tm_loop_middle = 999;
+  my $_rev_min_delta_tm_inner_middle = 999;
+  my $_rev_min_delta_tm_middle_outer = 999;
+  my $_rev_min_span_needed = 999999;
+  
+  my %_rev_pen_guards;
+  my $rev_prog_dir = "$options_r->{'output_file'}_rev_prog_$$";
+  $rev_prog_dir = "$options_r->{'output_file'}_rev_prog_$$" if ref($options_r);
+  use File::Path qw(make_path remove_tree);
+  remove_tree($rev_prog_dir) if -d $rev_prog_dir;
+  make_path($rev_prog_dir);
   my $_sig_rev_t0   = time();
   my $_sig_rev_done = 0;
   my $_sig_rev_hits = 0;  # Nombre de signatures Reverse trouvees / Reverse signatures found
-  print STDERR "  Recherche combinatoire Reverse: $innerReverseCount amorces B1c...\n";
+  my $pm_rev = LLNL::LAVA::ForkManager->new($options_r->{"threads"});
+  my $num_rev_chunks = $pm_rev->{max_processes} * 12;
+  $num_rev_chunks = 30 if $num_rev_chunks < 30;
+  $num_rev_chunks = $innerReverseCount if $num_rev_chunks > $innerReverseCount;
+  $num_rev_chunks = 1 if $num_rev_chunks < 1;
+  my $rev_chunk_size = int(($innerReverseCount + $num_rev_chunks - 1) / $num_rev_chunks);
+  $rev_chunk_size = 1 if $rev_chunk_size < 1;
 
-  for(my $innerIndex = 0; $innerIndex < $innerReverseCount; $innerIndex++)
-  {
-      # Barre de progression toutes les 50 iterations ou a 100%
-      # Progress bar every 50 iterations or at 100%
-      $_sig_rev_done = $innerIndex + 1;
-      if ($_sig_rev_done % 50 == 0 || $_sig_rev_done == $innerReverseCount) {
-        # Emission progression Flask / Flask progress emission
-        if ($_LAVA_IS_TTY || 1) {  # Toujours emettre pour Flask / Always emit for Flask
-          my $elapsed = time() - $_sig_rev_t0 + 0.001;
-          my $eta = ($_sig_rev_done < $innerReverseCount)
-                    ? int(($innerReverseCount - $_sig_rev_done) / ($_sig_rev_done / $elapsed))
-                    : 0;
-          my $rate = $_sig_rev_done / $elapsed;
-          printf("[LAVA-PROGRESS] Signatures Reverse|%d|%d|Sig: %d|%.1f it/s|%d\n",
-                 $_sig_rev_done, $innerReverseCount, $_sig_rev_hits, $rate, $eta);
-        }
+  $pm_rev->run_on_finish(sub {
+      my ($pid, $exit_code, $id, $exit_signal, $core_dump, $data_ref) = @_;
+      if (defined $data_ref && ref($data_ref) eq 'HASH') {
+          foreach my $idx (sort { $a <=> $b } keys %{$data_ref->{infos}}) {
+              if (!defined $bestReverseInfos[$idx]) {
+                  $reverseSetCount++;
+              }
+              $bestReverseInfos[$idx] = $data_ref->{infos}->{$idx};
+              $bestReversePenalties[$idx] = $data_ref->{penalties}->{$idx};
+          }
+          $_sig_rev_hits += $data_ref->{hits} || 0;
+          $_sig_rev_done += $data_ref->{done} || 0;
+          $_sig_rev_pruned += $data_ref->{pruned} || 0;
+          $_sig_rev_evaluated += $data_ref->{evaluated} || 0;
+          
+          $_rev_rej_geometry += $data_ref->{rej_geometry} || 0;
+          $_rev_rej_spacing += $data_ref->{rej_spacing} || 0;
+          $_rev_rej_loopgap += $data_ref->{rej_loopgap} || 0;
+          $_rev_rej_tm_inner_loop += $data_ref->{rej_tm_inner_loop} || 0;
+          $_rev_rej_tm_loop_middle += $data_ref->{rej_tm_loop_middle} || 0;
+          $_rev_rej_tm_inner_middle += $data_ref->{rej_tm_inner_middle} || 0;
+          $_rev_rej_tm_middle_outer += $data_ref->{rej_tm_middle_outer} || 0;
+          
+          foreach my $k (qw(min_tm_inner_loop min_tm_loop_middle min_tm_inner_middle min_tm_middle_outer min_span_needed)) {
+              next unless defined $data_ref->{$k};
+              if ($k eq 'min_tm_inner_loop') {
+                  $_rev_min_delta_tm_inner_loop = $data_ref->{$k} if $data_ref->{$k} < $_rev_min_delta_tm_inner_loop;
+              } elsif ($k eq 'min_tm_loop_middle') {
+                  $_rev_min_delta_tm_loop_middle = $data_ref->{$k} if $data_ref->{$k} < $_rev_min_delta_tm_loop_middle;
+              } elsif ($k eq 'min_tm_inner_middle') {
+                  $_rev_min_delta_tm_inner_middle = $data_ref->{$k} if $data_ref->{$k} < $_rev_min_delta_tm_inner_middle;
+              } elsif ($k eq 'min_tm_middle_outer') {
+                  $_rev_min_delta_tm_middle_outer = $data_ref->{$k} if $data_ref->{$k} < $_rev_min_delta_tm_middle_outer;
+              } elsif ($k eq 'min_span_needed') {
+                  $_rev_min_span_needed = $data_ref->{$k} if $data_ref->{$k} < $_rev_min_span_needed;
+              }
+          }
+          foreach my $k (qw(innerToLoop loopToMiddle innerToMiddle middleToOuter)) {
+              $_rev_pen_guards{"${k}_neg"} += $data_ref->{pen_guards}->{"${k}_neg"} || 0;
+              $_rev_pen_guards{"${k}_oob"} += $data_ref->{pen_guards}->{"${k}_oob"} || 0;
+          }
       }
-      my $innerInfo = $masterInnerR_r->[$innerIndex];
-      my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerR_data_r->[$innerIndex]};
-      
-      my $bestSetPenalty = 1000000;
-      
-      # 4.1 Calculate Search Bounds for Loop Primer (Reverse)
-      # Inner (B1c) is at $innerLocation. 
-      # Search starts after Inner and goes downstream (3').
-      
-      my $searchStartAt = $innerLocation + 1 + $minPrimerSpacing;
-      
-      my $searchEndAt = $innerLocation + $signatureMaxLength - $innerLength - 20; 
-      
-      # Determine Loop List to iterate
-      my $currentLoopList_r = $includeLoopPrimers ? $masterLoopR_r : $masterLoopR_r; 
-      my $currentLoopData_r = $includeLoopPrimers ? $masterLoopR_data_r : $masterLoopR_data_r;
-      my $loopCount = scalar(@{$currentLoopList_r});
-      
-      # If NO loops, we update the placeholder location to be valid (start of range)
-      if (!$includeLoopPrimers) {
-           $currentLoopData_r->[0]->[0] = $searchStartAt - 1; # Dummy valid location
-      }
+  });
 
-      for(my $i = 0; $i < $loopCount; $i++)
+  for (my $chunk_id = 0; $chunk_id < $num_rev_chunks; $chunk_id++) {
+      $pm_rev->start($chunk_id) and next;
+      
+      my %chunk_infos = ();
+      my %chunk_penalties = ();
+      my $chunk_hits = 0;
+      my $chunk_done = 0;
+      my $chunk_pruned = 0;
+      my $chunk_evaluated = 0;
+      my $chunk_rej_geometry = 0;
+      my $chunk_rej_spacing = 0;
+      my $chunk_rej_loopgap = 0;
+      my $chunk_rej_tm_inner_loop = 0;
+      my $chunk_rej_tm_loop_middle = 0;
+      my $chunk_rej_tm_inner_middle = 0;
+      my $chunk_rej_tm_middle_outer = 0;
+      my $chunk_min_delta_tm_inner_loop = 999;
+      my $chunk_min_delta_tm_loop_middle = 999;
+      my $chunk_min_delta_tm_inner_middle = 999;
+      my $chunk_min_delta_tm_middle_outer = 999;
+      my $chunk_min_span_needed = 999999;
+      my $penalty_guard_innerToLoop_neg = 0;
+      my $penalty_guard_innerToLoop_oob = 0;
+      my $penalty_guard_loopToMiddle_neg = 0;
+      my $penalty_guard_loopToMiddle_oob = 0;
+      my $penalty_guard_innerToMiddle_neg = 0;
+      my $penalty_guard_innerToMiddle_oob = 0;
+      my $penalty_guard_middleToOuter_neg = 0;
+      my $penalty_guard_middleToOuter_oob = 0;
+      
+      for(my $innerIndex = $chunk_id; $innerIndex < $innerReverseCount; $innerIndex += $num_rev_chunks)
       {
-          my $loopInfo = $currentLoopList_r->[$i];
-          my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
+          $chunk_done++;
+          my $innerInfo = $masterInnerR_r->[$innerIndex];
+          my ($innerLocation, $innerLength, $innerPenalty, $innerTm) = @{$masterInnerR_data_r->[$innerIndex]};
           
-          if ($includeLoopPrimers) {
-              # Fast-Fail: Sorted by location.
-              next if ($loopLocation < $searchStartAt);
-              last if ($loopLocation > $searchEndAt);
-
-              # --- DYNAMIC THERMAL FILTER (Inner vs Loop) ---
-              next if (abs($innerTm - $loopTm) > $maxTmDiff);
+          my $bestSetPenalty = 1000000;
+          
+          # 4.1 Calculate Search Bounds for Loop Primer (Reverse)
+          my $searchStartAt = $innerLocation + 1 + $minPrimerSpacing;
+          my $searchEndAt = $innerLocation + $signatureMaxLength - $innerLength - 20; 
+          
+          # Determine Loop List to iterate
+          my $currentLoopList_r = $includeLoopPrimers ? $masterLoopR_r : $masterLoopR_r; 
+          my $currentLoopData_r = $includeLoopPrimers ? $masterLoopR_data_r : $masterLoopR_data_r;
+          my $loopCount = scalar(@{$currentLoopList_r});
+          
+          if (!$includeLoopPrimers) {
+              $currentLoopData_r->[0]->[0] = $searchStartAt; 
           }
-          
-          # 4.2 Calculate Search Bounds for Middle Primer (B2)
-          # Middle (B2) is downstream of Loop.
-          my $middleStartAt = $loopLocation + $loopLength + $minPrimerSpacing;
-          
-          # Ensure Middle isn't too close to Inner (respecting loop gap or standard gap)
-          if ($includeLoopPrimers) {
-              my $altMiddleStartAt = $innerLocation + ($loopMinGap + 1);
-              $middleStartAt = $altMiddleStartAt if ($altMiddleStartAt > $middleStartAt);
-          } else {
-              my $altMiddleStartAt = $innerLocation + $minPrimerSpacing;
-              $middleStartAt = $altMiddleStartAt if ($altMiddleStartAt > $middleStartAt);
-          }
-          
-          my $middleEndAt = $searchEndAt;
 
-          my $innerToLoopDistance = $loopLocation - ($innerLocation + 1);
-          
-          my $middleCount = scalar(@{$masterMiddleR_r});
-          for(my $j = 0; $j < $middleCount; $j++)
+          for(my $i = 0; $i < $loopCount; $i++)
           {
-              my $middleInfo = $masterMiddleR_r->[$j];
-              my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleR_data_r->[$j]};
+              my $loopInfo = $currentLoopList_r->[$i];
+              my ($loopLocation, $loopLength, $loopPenalty, $loopTm) = @{$currentLoopData_r->[$i]};
               
-              # Fast-Fail
-              next if ($middleLocation < $middleStartAt);
-              last if ($middleLocation > $middleEndAt);
-              
-              # Validity Checks 
               if ($includeLoopPrimers) {
-                   # Check overlap with Loop
-                   next if ($middleLocation - $middleLength - $minPrimerSpacing < $loopLocation + $loopLength - 1);
-                   # Check Gap with Inner 
-                   next if ($middleLocation - $middleLength - $loopMinGap < $innerLocation);
+                  next if ($loopLocation < $searchStartAt);
+                  last if ($loopLocation > $searchEndAt);
+                  my $diff = abs($innerTm - $loopTm);
+                  if ($diff > $maxTmDiff) {
+                      $chunk_min_delta_tm_inner_loop = $diff if $diff < $chunk_min_delta_tm_inner_loop;
+                      $chunk_rej_tm_inner_loop++;
+                      next;
+                  }
               }
-
-              # --- DYNAMIC THERMAL FILTER (Neighbor Check) ---
+              
+              # 4.2 Calculate Search Bounds for Middle Primer (Reverse)
+              my $middleStartAt = $loopLocation + $loopLength + $minPrimerSpacing - $middlePrimerMaxLength + 1;
+              # [restauré depuis a6098f5 : contrainte loopMinGap/inner supprimee par 55328b2]
               if ($includeLoopPrimers) {
-                  # Loop vs Middle
-                  next if (abs($loopTm - $midTm) > $maxTmDiff);
+                  my $altMiddleStartAt = $innerLocation + ($loopMinGap + 1);
+                  $middleStartAt = $altMiddleStartAt if ($altMiddleStartAt > $middleStartAt);
               } else {
-                  # Inner vs Middle (if no loop)
-                  next if (abs($innerTm - $midTm) > $maxTmDiff);
+                  my $altMiddleStartAt = $innerLocation + $minPrimerSpacing;
+                  $middleStartAt = $altMiddleStartAt if ($altMiddleStartAt > $middleStartAt);
+              }
+              my $middleEndAt = $searchEndAt;
+              
+              my $innerToLoopDistance = $loopLocation - ($innerLocation + 1);
+              
+              
+              my $m_start = binary_search_first_ge($masterMiddleR_data_r, $middleStartAt);
+              my $m_end = binary_search_last_le($masterMiddleR_data_r, $middleEndAt);
+              if ($m_start != -1 && $m_end != -1 && $m_start <= $m_end) {
+                  my $min_P_mid_range = query_rmq($rmq_middle_r, $m_start, $m_end) * $middlePenaltyWeight;
+                  my $innerToLoopDistance = $includeLoopPrimers ? $loopLocation - ($innerLocation + 1) : 0;
+                  
+                  my $pen_innerToLoop = penaltyAt($innerToLoopPenalties_r, $innerToLoopDistance, 'innerToLoop');
+                  if ($pen_innerToLoop < 0) { $penalty_guard_innerToLoop_neg++; }
+                  if ($pen_innerToLoop == 9999) { $penalty_guard_innerToLoop_oob++; }
+                  
+                  my $base_penalty = ($innerPenalty * $innerPenaltyWeight) + 
+                                     ($includeLoopPrimers ? $loopPenalty * $loopPenaltyWeight : 0) + 
+                                     ($includeLoopPrimers ? $pen_innerToLoop * $innerToLoopPenaltyWeight : 0);
+                  my $min_S_to_mid = $includeLoopPrimers ? $minS_loopToMiddle_R : $minS_innerToMiddle_R;
+                  
+                  if ($base_penalty + $min_P_mid_range + $min_P_outer_R + $min_S_to_mid + $minS_middleToOuter_R >= $bestSetPenalty) {
+                      $chunk_pruned += ($m_end - $m_start + 1);
+                  } else {
+                      for(my $j = $m_start; $j <= $m_end; $j++)
+                      {
+                          my $middleInfo = $masterMiddleR_r->[$j];
+                          my ($middleLocation, $middleLength, $middlePenalty, $midTm) = @{$masterMiddleR_data_r->[$j]};
+                          
+                          if ($includeLoopPrimers) {
+                              my $loopToMiddleDistance = ($middleLocation - $middleLength + 1) - ($loopLocation + $loopLength);
+                              if ($loopToMiddleDistance < 0) {
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              my $needed = $minPrimerSpacing - $loopToMiddleDistance;
+                              if ($needed > 0) {
+                                  my $span = $middleLocation - ($innerLocation - $innerLength) + $needed;
+                                  $chunk_min_span_needed = $span if $span < $chunk_min_span_needed;
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              if ($middleLocation - $loopMinGap < $innerLocation + $innerLength) { $chunk_rej_loopgap++; next; }
+                              my $diffLM = abs($loopTm - $midTm);
+                              if ($diffLM > $maxTmDiff && !($loopInfo->hasTag("is_fixed") || $middleInfo->hasTag("is_fixed"))) {
+                                  $chunk_min_delta_tm_loop_middle = $diffLM if $diffLM < $chunk_min_delta_tm_loop_middle;
+                                  $chunk_rej_tm_loop_middle++;
+                                  next;
+                              }
+                          } else {
+                              my $innerToMiddleDistance = ($middleLocation - $middleLength + 1) - $innerLocation;
+                              if ($innerToMiddleDistance < 0) {
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              my $needed = $minPrimerSpacing - $innerToMiddleDistance;
+                              if ($needed > 0) {
+                                  my $span = $middleLocation - ($innerLocation - $innerLength) + $needed;
+                                  $chunk_min_span_needed = $span if $span < $chunk_min_span_needed;
+                                  $chunk_rej_spacing++;
+                                  next;
+                              }
+                              my $diffIM = abs($innerTm - $midTm);
+                              if ($diffIM > $maxTmDiff && !($innerInfo->hasTag("is_fixed") || $middleInfo->hasTag("is_fixed"))) {
+                                  $chunk_min_delta_tm_inner_middle = $diffIM if $diffIM < $chunk_min_delta_tm_inner_middle;
+                                  $chunk_rej_tm_inner_middle++;
+                                  next;
+                              }
+                          }
+                          
+                          my $outerStartAt = $middleLocation + $minPrimerSpacing - $outerPrimerMaxLength + 1;
+                          my $outerEndAt = $searchEndAt;
+                          
+                          my $loopToMiddleDistance = $includeLoopPrimers ? ($middleLocation - $middleLength + 1) - ($loopLocation + $loopLength) : 0;
+                          my $innerToMiddleDistance = ($middleLocation - $middleLength + 1) - $innerLocation;
+                          
+                          my $o_start = binary_search_first_ge($masterOuterR_data_r, $outerStartAt);
+                          my $o_end = binary_search_last_le($masterOuterR_data_r, $outerEndAt);
+                          if ($o_start != -1 && $o_end != -1 && $o_start <= $o_end) {
+                              my $min_P_out_range = query_rmq($rmq_outer_r, $o_start, $o_end) * $outerPenaltyWeight;
+                              
+                              my $pen_mid = $includeLoopPrimers ? penaltyAt($loopToMiddlePenalties_r, $loopToMiddleDistance, 'loopToMiddle') : penaltyAt($innerToMiddlePenalties_r, $innerToMiddleDistance, 'innerToMiddle');
+                              if ($pen_mid < 0) { if($includeLoopPrimers) { $penalty_guard_loopToMiddle_neg++; } else { $penalty_guard_innerToMiddle_neg++; } }
+                              if ($pen_mid == 9999) { if($includeLoopPrimers) { $penalty_guard_loopToMiddle_oob++; } else { $penalty_guard_innerToMiddle_oob++; } }
+
+                              my $part_penalty = $base_penalty + ($middlePenalty * $middlePenaltyWeight) + 
+                                                 ($pen_mid * ($includeLoopPrimers ? $loopToMiddlePenaltyWeight : $innerToMiddlePenaltyWeight));
+                              
+                              if ($part_penalty + $min_P_out_range + $minS_middleToOuter_R >= $bestSetPenalty) {
+                                  $chunk_pruned += ($o_end - $o_start + 1);
+                              } else {
+                                  for(my $k = $o_start; $k <= $o_end; $k++)
+                                  {
+                                      $chunk_evaluated++;
+                                      my $outerInfo = $masterOuterR_r->[$k];
+                                      my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterR_data_r->[$k]};
+                                      
+                                      my $middleToOuterDistance = ($outerLocation - $outerLength + 1) - $middleLocation;
+                                      if ($middleToOuterDistance < 0) {
+                                          $chunk_rej_spacing++;
+                                          next;
+                                      }
+                                      my $needed = $minPrimerSpacing - $middleToOuterDistance;
+                                      if ($needed > 0) {
+                                          my $span = $outerLocation - ($innerLocation - $innerLength) + $needed;
+                                          $chunk_min_span_needed = $span if $span < $chunk_min_span_needed;
+                                          $chunk_rej_spacing++;
+                                          next;
+                                      }
+                                      my $diffMO = abs($midTm - $outTm);
+                                      if ($diffMO > $maxTmDiff) {
+                                          $chunk_min_delta_tm_middle_outer = $diffMO if $diffMO < $chunk_min_delta_tm_middle_outer;
+                                          $chunk_rej_tm_middle_outer++;
+                                          next;
+                                      }
+                                      
+                                      my $pen_out = penaltyAt($middleToOuterPenalties_r, $middleToOuterDistance, 'middleToOuter');
+                                      if ($pen_out < 0) { $penalty_guard_middleToOuter_neg++; }
+                                      if ($pen_out == 9999) { $penalty_guard_middleToOuter_oob++; }
+                                      
+                                      my $spacingPenalty = ($includeLoopPrimers ? $pen_innerToLoop * $innerToLoopPenaltyWeight : 0) +
+                                                           ($pen_mid * ($includeLoopPrimers ? $loopToMiddlePenaltyWeight : $innerToMiddlePenaltyWeight)) +
+                                                           ($pen_out * $middleToOuterPenaltyWeight);
+                                      
+                                      my $primer3Penalty = $innerPenalty * $innerPenaltyWeight + ($includeLoopPrimers ? $loopPenalty * $loopPenaltyWeight : 0) + $middlePenalty * $middlePenaltyWeight + $outerPenalty * $outerPenaltyWeight;
+                                      
+                                      my $detailStr = "";
+                                      if ($includeLoopPrimers) {
+                                          $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
+                                                ($pen_innerToLoop * $innerToLoopPenaltyWeight), ($pen_mid * $loopToMiddlePenaltyWeight), ($pen_out * $middleToOuterPenaltyWeight),
+                                                ($innerPenalty * $innerPenaltyWeight), ($loopPenalty * $loopPenaltyWeight), ($middlePenalty * $middlePenaltyWeight), ($outerPenalty * $outerPenaltyWeight));
+                                      } else {
+                                          $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
+                                                ($pen_mid * $innerToMiddlePenaltyWeight), ($pen_out * $middleToOuterPenaltyWeight),
+                                                ($innerPenalty * $innerPenaltyWeight), ($middlePenalty * $middlePenaltyWeight), ($outerPenalty * $outerPenaltyWeight));
+                                      }
+                                      
+                                      my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
+                                      if ($currentSetPenalty < $bestSetPenalty) {
+                                          $chunk_hits++ unless exists $chunk_infos{$innerIndex};
+                                          $chunk_infos{$innerIndex} = $includeLoopPrimers ? [$loopInfo, $middleInfo, $outerInfo] : [$middleInfo, $outerInfo];
+                                          $chunk_penalties{$innerIndex} = [$spacingPenalty, $primer3Penalty, $detailStr];
+                                          $bestSetPenalty = $currentSetPenalty;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
 
-              # 4.3 Calculate Search Bounds for Outer Primer (B3)
-              my $outerStartAt = $middleLocation + 1 + $minPrimerSpacing;
-              my $outerEndAt = $searchEndAt;
-              
-              my $loopToMiddleDistance = ($middleLocation - $middleLength + 1) - ($loopLocation + $loopLength);
-
-              my $outerCount = scalar(@{$masterOuterR_r});
-              for(my $k = 0; $k < $outerCount; $k++)
-              {
-                  my $outerInfo = $masterOuterR_r->[$k];
-                  my ($outerLocation, $outerLength, $outerPenalty, $outTm) = @{$masterOuterR_data_r->[$k]};
+          } # End Loop
+          
+          # Intra-chunk progress reporting
+          if ($chunk_done % 5 == 0) {
+              my $prog_file_me = "$rev_prog_dir/chunk_$chunk_id.prog";
+              if (open(my $fh, '>', $prog_file_me)) {
+                  flock($fh, 2);
+                  print $fh "$chunk_done,$chunk_hits,$chunk_pruned,$chunk_evaluated\n";
+                  close($fh);
+              }
                   
-                  # Fast-Fail
-                  next if ($outerLocation < $outerStartAt);
-                  last if ($outerLocation > $outerEndAt);
-                  
-                  # Distance Check : B3_leftmost - spacing > B2_rightmost (gap >= minPrimerSpacing)
-                  # Correction off-by-one : leftmost de B3 = outerLocation - outerLength + 1
-                  next if ($outerLocation - $outerLength + 1 - $minPrimerSpacing <= $middleLocation);
-
-                  # --- DYNAMIC THERMAL FILTER (Middle vs Outer) ---
-                  next if (abs($midTm - $outTm) > $maxTmDiff);
-                  
-                  # Calculate Penalty
-                  my $middleToOuterDistance = ($outerLocation - $outerLength) - $middleLocation;
-                  my $innerToMiddleDistance = ($middleLocation - $middleLength) - $innerLocation;
-                  
-                  my $spacingPenalty = 0;
-                  my $primer3Penalty = 0;
-                  my $detailStr = "";
-                  
-                  if ($includeLoopPrimers) {
-                      $spacingPenalty = 
-                          ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight) +
-                          ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $loopPenalty * $loopPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_L:%.1f L_M:%.1f M_O:%.1f] Thm[I:%.1f L:%.1f M:%.1f O:%.1f]", 
-                            ($innerToLoopPenalties_r->[$innerToLoopDistance] * $innerToLoopPenaltyWeight),
-                            ($loopToMiddlePenalties_r->[$loopToMiddleDistance] * $loopToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($loopPenalty * $loopPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
-                  } else {
-                      $spacingPenalty = 
-                          ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight) +
-                          ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight);
-                          
-                      $primer3Penalty = 
-                          $innerPenalty * $innerPenaltyWeight +
-                          $middlePenalty * $middlePenaltyWeight +
-                          $outerPenalty * $outerPenaltyWeight;
-                      
-                      $detailStr = sprintf("Spc[I_M:%.1f M_O:%.1f] Thm[I:%.1f M:%.1f O:%.1f]", 
-                            ($innerToMiddlePenalties_r->[$innerToMiddleDistance] * $innerToMiddlePenaltyWeight),
-                            ($middleToOuterPenalties_r->[$middleToOuterDistance] * $middleToOuterPenaltyWeight),
-                            ($innerPenalty * $innerPenaltyWeight),
-                            ($middlePenalty * $middlePenaltyWeight),
-                            ($outerPenalty * $outerPenaltyWeight)
-                            );
+              my $total_done = 0;
+              my $total_hits = 0;
+              foreach my $f (glob("$rev_prog_dir/chunk_*.prog")) {
+                  if (open(my $r, '<', $f)) {
+                      my $line = <$r>; close($r);
+                      next unless defined $line;
+                      chomp $line;
+                      my ($d, $h) = split /,/, $line;
+                      $total_done += $d // 0;
+                      $total_hits += $h // 0;
                   }
-                  
-                  my $currentSetPenalty = $spacingPenalty + $primer3Penalty;
-                  
-                  if ($currentSetPenalty < $bestSetPenalty) {
-                      $bestReverseInfos[$innerIndex] = [$loopInfo, $middleInfo, $outerInfo];
-                      $bestSetPenalty = $currentSetPenalty;
-                      $bestReversePenalties[$innerIndex] = [$spacingPenalty, $primer3Penalty, $detailStr];
-                      $reverseSetCount++;
-                      $_sig_rev_hits++;  # Compteur de signatures Reverse / Reverse signature counter
-                  }
-              } # End Outer
-          } # End Middle
-      } # End Loop
-  } # End Inner
+              }
+                      
+              if ($_LAVA_IS_TTY || 1) {
+                  my $elapsed = time() - $_sig_rev_t0 + 0.001;
+                  my $eta = ($total_done < $innerReverseCount) ? int(($innerReverseCount - $total_done) / ($total_done / $elapsed)) : 0;
+                  my $rate = $total_done / $elapsed;
+                  printf("[LAVA-PROGRESS] Signatures Reverse|%d|%d|Sig: %d|%.1f it/s|%d\r", $total_done, $innerReverseCount, $total_hits, $rate, $eta);
+                  my $old_h = select(STDOUT); $| = 1; select($old_h);
+              }
+          }
+} # End Inner chunk loop
+      
+      my $prog_file_me = "$rev_prog_dir/chunk_$chunk_id.prog";
+      if (open(my $fh, '>', $prog_file_me)) { flock($fh, 2); print $fh "$chunk_done,$chunk_hits,$chunk_pruned,$chunk_evaluated\n"; close($fh); }
+      
+      $pm_rev->finish(0, {
+          infos => \%chunk_infos,
+          penalties => \%chunk_penalties,
+          hits => $chunk_hits,
+          done => $chunk_done,
+          pruned => $chunk_pruned,
+          evaluated => $chunk_evaluated,
+          rej_geometry => $chunk_rej_geometry,
+          rej_spacing => $chunk_rej_spacing,
+          rej_loopgap => $chunk_rej_loopgap,
+          rej_tm_inner_loop => $chunk_rej_tm_inner_loop,
+          rej_tm_loop_middle => $chunk_rej_tm_loop_middle,
+          rej_tm_inner_middle => $chunk_rej_tm_inner_middle,
+          rej_tm_middle_outer => $chunk_rej_tm_middle_outer,
+          min_tm_inner_loop => $chunk_min_delta_tm_inner_loop,
+          min_tm_loop_middle => $chunk_min_delta_tm_loop_middle,
+          min_tm_inner_middle => $chunk_min_delta_tm_inner_middle,
+          min_tm_middle_outer => $chunk_min_delta_tm_middle_outer,
+          min_span_needed => $chunk_min_span_needed,
+          pen_guards => {
+              innerToLoop_neg => $penalty_guard_innerToLoop_neg,
+              innerToLoop_oob => $penalty_guard_innerToLoop_oob,
+              loopToMiddle_neg => $penalty_guard_loopToMiddle_neg,
+              loopToMiddle_oob => $penalty_guard_loopToMiddle_oob,
+              innerToMiddle_neg => $penalty_guard_innerToMiddle_neg,
+              innerToMiddle_oob => $penalty_guard_innerToMiddle_oob,
+              middleToOuter_neg => $penalty_guard_middleToOuter_neg,
+              middleToOuter_oob => $penalty_guard_middleToOuter_oob,
+          }
+      });
+  } # End chunks
+  $pm_rev->wait_all_children();
+  use File::Path qw(remove_tree);
+  remove_tree($rev_prog_dir) if -d $rev_prog_dir;
+  
+  if ($_sig_rev_pruned + $_sig_rev_evaluated > 0) {
+      my $pct = ($_sig_rev_pruned / ($_sig_rev_pruned + $_sig_rev_evaluated)) * 100;
+      print sprintf("    [Reverse B&B] Elagage: %.2f%%\n", $pct);
+  }
 
+  @guard_msgs = ();
+  foreach my $k (qw(innerToLoop loopToMiddle innerToMiddle middleToOuter)) {
+      if ($_rev_pen_guards{"${k}_neg"}) {
+          push @guard_msgs, "$k(neg: $_rev_pen_guards{\"${k}_neg\"})";
+      }
+      if ($_rev_pen_guards{"${k}_oob"}) {
+          push @guard_msgs, "$k(oob: $_rev_pen_guards{\"${k}_oob\"})";
+      }
+  }
+  if (@guard_msgs) {
+      print "    [PENALTY GUARD] Declenchements Reverse : " . join(", ", @guard_msgs) . "\n";
+  }
+
+  
   # Finaliser la barre Reverse / Finalize Reverse bar
-  print "  [Reverse] $reverseSetCount combinaisons Reverse trouvees sur $innerReverseCount amorces B1c.\n";
+  print "  [Reverse] $reverseSetCount combinaisons Reverse trouvees sur $innerReverseCount amorces B1.\n";
 
   if($reverseSetCount == 0) {
-      print "No valid reverse primer combinations found.\n";
-      print "WARNING: No reverse sets found.\n";
+      print_zero_signature_diagnostic(0, $innerReverseCount, scalar(@$masterOuterR_r),
+        $_rev_rej_geometry, $_rev_rej_spacing, $_rev_rej_loopgap,
+        $_rev_rej_tm_inner_loop, $_rev_rej_tm_loop_middle, $_rev_rej_tm_inner_middle, $_rev_rej_tm_middle_outer,
+        $_rev_min_delta_tm_inner_loop, $_rev_min_delta_tm_loop_middle, $_rev_min_delta_tm_inner_middle, $_rev_min_delta_tm_middle_outer,
+        $_rev_min_span_needed, $signatureMaxLength, $maxTmDiff, $options_r);
+      exit 0;
   }
 
   #-----------------------------------------------------------------------------
-  # 5. COMBINE HALVES & CREATE SIGNATURES
+  # 5. COMBINE HALVES & CREATE SIGNATURES (PARTITIONED WORKERS)
   #-----------------------------------------------------------------------------
-  print "Combining Best F/R Halves to create LAMP Signatures...\n";
+  print "Combining Best F/R Halves to create LAMP Signatures (Partitioned Workers)...\n";
   
-  my $combinedSignatureCount = 0;
+  my $combine_total = scalar(@{$masterInnerF_r});
+  my $combine_t0 = time();
 
-  for(my $i = 0; $i < scalar(@{$masterInnerF_r}); $i++) {
-      next unless defined $bestForwardInfos[$i]; # Skip if no valid F-half found
+  my $max_retained_signatures = $options_r->{"max_retained_signatures"} || 100000;
+  
+  my $val_pm = LLNL::LAVA::ForkManager->new($options_r->{"threads"});
+  my $actual_threads = $val_pm->{max_processes};
+  my $verbose_val = $options_r->{"verbose_validation"} ? 1 : 0;
+  my $verbose_base = $options_r->{"output_file"} . "_validation_detail";
+  
+  my $num_chunks = $actual_threads * 4;
+  $num_chunks = $combine_total if $num_chunks > $combine_total;
+  $num_chunks = 1 if $num_chunks < 1;
+  
+  if ($_LAVA_IS_TTY || 1) {
+      printf("[LAVA-PROGRESS] Combinaison & Validation|0|%d|Chunks: 0/%d|0.0 it/s|0\r", $combine_total, $num_chunks);
+      my $old_h = select(STDOUT); $| = 1; select($old_h);
+  }
+  
+  my %chunk_results_map;
+  my $global_combined_count = 0;
+  my $global_val_done = 0;
+  my $global_val_passed = 0;
+  my $global_val_rejected = 0;
+  my $global_immediate_rejections = 0;
+  my $global_rejected_max_len = 0;
+  my $global_rejected_min_len = 0;
+  my $global_skipped_tm_diff = 0;
+  my $global_skipped_inner_gap = 0;
+  
+  $val_pm->run_on_finish(sub {
+      my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_r) = @_;
+      if (defined($data_r) && ref($data_r) eq 'HASH') {
+          my $cid = $data_r->{chunk_id};
+          $chunk_results_map{$cid} = $data_r->{retained};
+          $global_combined_count += $data_r->{combined_count};
+          $global_val_done += $data_r->{val_done};
+          $global_val_passed += $data_r->{val_passed};
+          $global_val_rejected += $data_r->{val_rejected};
+          $global_immediate_rejections += $data_r->{immediate_rejections};
+          $global_rejected_max_len += $data_r->{rejected_max_len} if defined $data_r->{rejected_max_len};
+          $global_rejected_min_len += $data_r->{rejected_min_len} if defined $data_r->{rejected_min_len};
+          $global_skipped_tm_diff += $data_r->{skipped_tm_diff} if defined $data_r->{skipped_tm_diff};
+          $global_skipped_inner_gap += $data_r->{skipped_inner_gap} if defined $data_r->{skipped_inner_gap};
+          
+          my $elapsed = time() - $combine_t0 + 0.001;
+          my $chunks_done = scalar(keys %chunk_results_map);
+          my $rate = $global_val_done / $elapsed;
+          my $eta = ($chunks_done < $num_chunks) ? int(($elapsed / $chunks_done) * ($num_chunks - $chunks_done)) : 0;
+          printf("[LAVA-PROGRESS] Combinaison & Validation|%d|%d|Chunks: %d/%d|%.1f it/s|%d\r", 
+                 $global_val_done, $global_val_done, $chunks_done, $num_chunks, $rate, $eta);
+          my $old_h = select(STDOUT); $| = 1; select($old_h);
+      }
+  });
+  
+  for(my $chunk_id = 0; $chunk_id < $num_chunks; $chunk_id++) {
+      $val_pm->start and next;
       
-      my $innerF = $masterInnerF_r->[$i];
-      my $f_set_infos = $bestForwardInfos[$i]; # [LoopF, MidF, OutF]
-       
-      # InnerF (F1c) Location data
-      # Note: $innerF is a PrimerInfo. 
-      # $innerF->getLocation() is the END of the primer on the Plus strand (for Fwd? No).
-      # Let's verify standard LAVA location semantics:
-      # Forward Primer: Start lowest, End highest. Location = End? 
-      # Reverse Primer: Start lowest (5' on minus), End highest (3' on minus, physical 5' on plus).
-      # Typically LAVA uses "Genome Coordinates".
-      # Let's trust the `enumeratePairs` logic which I replaced or the earlier lookups.
-      # better: use the raw data arrays I prepared
-      my $f1c_location = $masterInnerF_data_r->[$i]->[0]; # This is Location 
-      my $f1c_length = $masterInnerF_data_r->[$i]->[1];
-      my $f1c_tm = $masterInnerF_data_r->[$i]->[3]; # Unpack cached Tm
+      my @chunk_retained;
+      my $chunk_combined = 0;
+      my $chunk_val_done = 0;
+      my $chunk_val_passed = 0;
+      my $chunk_val_rejected = 0;
+      my $chunk_immediate = 0;
+      my $chunk_rejected_max_len = 0;
+      my $chunk_rejected_min_len = 0;
       
-      # F1c is "Inner Forward". In LAMP, F1c is the complement of F1.
-      # But LAVA PrimerSet::LAMP expects "Inner Info", which contains an "Analyzed Pair".
-      # Each `*_info` is a `LLNL::LAVA::PrimerSetInfo::PCRPair`. 
+      my $verbose_fh;
+      if ($verbose_val) {
+          open($verbose_fh, "| gzip >> ${verbose_base}.$$" . "_${chunk_id}.log.gz") or warn "Cannot open verbose log";
+      }
       
-      for(my $j = 0; $j < scalar(@{$masterInnerR_r}); $j++) {
-          next unless defined $bestReverseInfos[$j];
-          
-          my $innerR = $masterInnerR_r->[$j];
-          my $r_set_infos = $bestReverseInfos[$j]; # [LoopR, MidR, OutR]
-          
-          my $b1c_location = $masterInnerR_data_r->[$j]->[0];
-          my $b1c_length = $masterInnerR_data_r->[$j]->[1];
-          my $b1c_tm = $masterInnerR_data_r->[$j]->[3]; # Unpack cached Tm
-          
-          # --- DYNAMIC THERMAL FILTER (Inner Pair) ---
-          next if (abs($f1c_tm - $b1c_tm) > $maxTmDiff);
-          
-          # Check Inner Distance (Target: 0-50 usually, or just non-overlapping)
-          # F1c (InnerF) is upstream of B1c (InnerR).
-          
-          # Gap Calculation
-          # Forward End = $f1c_location
-          # Reverse Start = $b1c_location - $b1c_length + 1
-          # Gap = ReverseStart - ForwardEnd - 1
-          
-          my $b1c_start_genome = $b1c_location - $b1c_length + 1;
-          my $inner_gap = $b1c_start_genome - $f1c_location - 1;
-          
-          # Validity Checks
-          next if ($inner_gap < 0); # Overlap
-          next if ($inner_gap > 100); # Too far apart (Inner Gap Limit)
+      # Compteurs de rejets pour l'assemblage
+      my $skipped_tm_diff = 0;
+      my $skipped_inner_gap = 0;
 
-          # VALIDATION COMPLETE D'ESPACEMENT - tous les primers de la signature
-          # Full spacing validation - all primers in the signature (mirrors STEM behavior)
-          # Sans ce guard, des primers cross-strand (F3/B3, F2/B2) peuvent se chevaucher
-          # Without this guard, cross-strand primers (F3/B3, F2/B2) can overlap
-          my @fwdPrimers = ();
-          my @revPrimers = ();
+      for(my $i = $chunk_id; $i < $combine_total; $i += $num_chunks) {
+          next unless defined $bestForwardInfos[$i]; 
+          
+          my $innerF = $masterInnerF_r->[$i];
+          my $f_set_infos = $bestForwardInfos[$i];
+          my $f1c_location = $masterInnerF_data_r->[$i]->[0]; 
+          my $f1c_length = $masterInnerF_data_r->[$i]->[1];
+          my $f1c_tm = $masterInnerF_data_r->[$i]->[3];
+          
+          for(my $j = 0; $j < scalar(@{$masterInnerR_r}); $j++) {
+              next unless defined $bestReverseInfos[$j];
+              
+              my $innerR = $masterInnerR_r->[$j];
+              my $r_set_infos = $bestReverseInfos[$j];
+              my $b1c_location = $masterInnerR_data_r->[$j]->[0];
+              my $b1c_length = $masterInnerR_data_r->[$j]->[1];
+              my $b1c_tm = $masterInnerR_data_r->[$j]->[3];
+              
+              if (abs($f1c_tm - $b1c_tm) > $maxTmDiff) {
+                  $skipped_tm_diff++;
+                  if ($verbose_val) {
+                      print $verbose_fh "    -> Skipped (Tm diff > $maxTmDiff): f1c_tm=$f1c_tm, b1c_tm=$b1c_tm\n";
+                  }
+                  next;
+              }
+              
+              my $b1c_start_genome = $b1c_location - $b1c_length + 1;
+              my $inner_gap = $b1c_start_genome - $f1c_location - 1;
+              if ($inner_gap < 0) {
+                  $skipped_inner_gap++;
+                  if ($verbose_val) {
+                      print $verbose_fh "    -> Skipped (inner_gap < 0): inner_gap=$inner_gap, b1c_start_genome=$b1c_start_genome, f1c_location=$f1c_location\n";
+                  }
+                  next;
+              }
+              
+              my @fwdPrimers = ();
+              my @revPrimers = ();
+              
+              my $outF_v = $f_set_infos->[2];
+              my $midF_v = $f_set_infos->[1];
+              $outF_v->{name} = 'F3';
+              $midF_v->{name} = 'F2';
+              $innerF->{name} = 'F1';
+              push @fwdPrimers, $outF_v, $midF_v, $innerF;
+              if ($includeLoopPrimers) {
+                my $loopF_v = $f_set_infos->[0];
+                $loopF_v->{name} = 'FL';
+                push @fwdPrimers, $loopF_v;
+              }
+              
+              my $outR_v = $r_set_infos->[2];
+              my $midR_v = $r_set_infos->[1];
+              $innerR->{name} = 'B1';
+              $midR_v->{name} = 'B2';
+              $outR_v->{name} = 'B3';
+              push @revPrimers, $innerR, $midR_v, $outR_v;
+              if ($includeLoopPrimers) {
+                my $loopR_v = $r_set_infos->[0];
+                $loopR_v->{name} = 'BL';
+                unshift @revPrimers, $loopR_v;
+              }
+              
+              if (!validateCompleteSignatureSpacing(\@fwdPrimers, \@revPrimers, $minPrimerSpacing)) {
+                  $chunk_immediate++;
+                  next;
+              }
 
-          my $outF_v = $f_set_infos->[2];  # F3
-          my $midF_v = $f_set_infos->[1];  # F2
-          $outF_v->{name} = 'F3';
-          $midF_v->{name} = 'F2';
-          $innerF->{name} = 'F1';
-          push @fwdPrimers, $outF_v, $midF_v, $innerF;
-          if ($includeLoopPrimers) {
-            my $loopF_v = $f_set_infos->[0];
-            $loopF_v->{name} = 'FL';
-            push @fwdPrimers, $loopF_v;
+              my $fStart_v   = $f_set_infos->[2]->getLocation();   # F3, brin plus : bord gauche
+              my $rEnd_v     = $r_set_infos->[2]->getLocation();   # B3, brin moins : bord droit
+              my $totalLen_v = $rEnd_v - $fStart_v + 1;
+              if ($totalLen_v > $signatureMaxLength) {
+                  $chunk_rejected_max_len++;
+                  next;
+              }
+              if ($signatureMinLength > 0 && $totalLen_v < $signatureMinLength) {
+                  $chunk_rejected_min_len++;
+                  next;
+              }
+              
+              my $innerPair = LLNL::LAVA::PrimerSet::PCRPair->new({ "forward_info" => $innerF, "reverse_info" => $innerR });
+              my $innerSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({ "analyzed_pair" => $innerPair, "penalty" => $innerF->getPenalty() + $innerR->getPenalty() });
+              my $midF = $f_set_infos->[1]; my $midR = $r_set_infos->[1];
+              my $middlePair = LLNL::LAVA::PrimerSet::PCRPair->new({ "forward_info" => $midF, "reverse_info" => $midR });
+              my $middleSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({ "analyzed_pair" => $middlePair, "penalty" => $midF->getPenalty() + $midR->getPenalty() });
+              my $outF = $f_set_infos->[2]; my $outR = $r_set_infos->[2];
+              my $outerPair = LLNL::LAVA::PrimerSet::PCRPair->new({ "forward_info" => $outF, "reverse_info" => $outR });
+              my $outerSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({ "analyzed_pair" => $outerPair, "penalty" => $outF->getPenalty() + $outR->getPenalty() });
+              
+              my $lampSignature = LLNL::LAVA::PrimerSet::LAMP->new({
+                  "inner_info" => $innerSetInfo, "middle_info" => $middleSetInfo, "outer_info" => $outerSetInfo,
+              });
+              if($includeLoopPrimers) {
+                   my $loopF = $f_set_infos->[0]; my $loopR = $r_set_infos->[0];
+                   $lampSignature->setTag("has_loop_primers", 1);
+                   $lampSignature->setTag("floop_info", $loopF);
+                   $lampSignature->setTag("bloop_info", $loopR);
+              } else {
+                   $lampSignature->setTag("has_loop_primers", 0);
+              }
+              
+              my $f_penalty = $bestForwardPenalties[$i]->[0] + $bestForwardPenalties[$i]->[1];
+              my $r_penalty = $bestReversePenalties[$j]->[0] + $bestReversePenalties[$j]->[1];
+              my $inner_span_penalty = 0;
+              if (defined $innerToInnerPenalties_r && @$innerToInnerPenalties_r) {
+                  $inner_span_penalty = penaltyAt($innerToInnerPenalties_r, $inner_gap) * $innerForwardToReversePenaltyWeight;
+              }
+              
+              # Calcul de la pénalité de longueur totale / Calculate total length penalty
+              my $len_penalty = 0;
+              if ($totalLen_v > $totalSignatureLength) {
+                  if ($totalLen_v >= $signatureMaxLength) {
+                      $len_penalty = $signatureLengthPenaltyWeight;
+                  } elsif ($signatureMaxLength > $totalSignatureLength) {
+                      my $ratio = ($totalLen_v - $totalSignatureLength) / ($signatureMaxLength - $totalSignatureLength);
+                      $len_penalty = $signatureLengthPenaltyWeight * ($ratio * $ratio);
+                  }
+              }
+              
+              my $lamp_penalty = $f_penalty + $r_penalty + $inner_span_penalty + $len_penalty;
+              $lampSignature->setTag("lamp_penalty", $lamp_penalty);
+              
+              $chunk_combined++;
+              
+              my ($target_count, $coverage, $status) = calculateSignatureIntersection(
+                  $lampSignature, $inputMSA->num_sequences(), $signatureCommonTargetMinPercent,
+                  $includeLoopPrimers, "loop", $verbose_val, $verbose_fh, 0
+              );
+              $chunk_val_done++;
+              
+              if ($status eq "VALIDEE") {
+                  $chunk_val_passed++;
+                  push @chunk_retained, [$i, $j, $lamp_penalty, $coverage, $target_count, $inner_span_penalty, $len_penalty];
+              } else {
+                  $chunk_val_rejected++;
+              }
+              
+              if (scalar(@chunk_retained) > $max_retained_signatures * 2) {
+                  @chunk_retained = sort { $a->[2] <=> $b->[2] } @chunk_retained;
+                  splice(@chunk_retained, $max_retained_signatures);
+              }
           }
-
-          my $outR_v = $r_set_infos->[2];  # B3
-          my $midR_v = $r_set_infos->[1];  # B2
-          $innerR->{name} = 'B1';
-          $midR_v->{name} = 'B2';
-          $outR_v->{name} = 'B3';
-          push @revPrimers, $innerR, $midR_v, $outR_v;
-          if ($includeLoopPrimers) {
-            my $loopR_v = $r_set_infos->[0];
-            $loopR_v->{name} = 'BL';
-            unshift @revPrimers, $loopR_v;
-          }
-
-          next if (!validateCompleteSignatureSpacing(\@fwdPrimers, \@revPrimers, $minPrimerSpacing));
-
-          # Construct PCR Pairs
-          # 1. Inner Pair (F1c, B1c)
-          my $innerPair = LLNL::LAVA::PrimerSet::PCRPair->new({
-              "forward_info" => $innerF,
-              "reverse_info" => $innerR
-          });
-          my $innerSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({
-              "analyzed_pair" => $innerPair,
-              "penalty" => $innerF->getPenalty() + $innerR->getPenalty()
-          });
-          
-          # 2. Middle Pair (F2, B2)
-          my $midF = $f_set_infos->[1];
-          my $midR = $r_set_infos->[1];
-          my $middlePair = LLNL::LAVA::PrimerSet::PCRPair->new({
-              "forward_info" => $midF,
-              "reverse_info" => $midR
-          });
-          my $middleSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({
-              "analyzed_pair" => $middlePair,
-              "penalty" => $midF->getPenalty() + $midR->getPenalty()
-          });
-
-          # 3. Outer Pair (F3, B3)
-          my $outF = $f_set_infos->[2];
-          my $outR = $r_set_infos->[2];
-          my $outerPair = LLNL::LAVA::PrimerSet::PCRPair->new({
-              "forward_info" => $outF,
-              "reverse_info" => $outR
-          });
-          my $outerSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({
-              "analyzed_pair" => $outerPair,
-              "penalty" => $outF->getPenalty() + $outR->getPenalty()
-          });
-          
-          # Create LAMP Signature
-          # Note: Loop primers are attached as TAGS on the signature object usually, 
-          # OR passed in specifically if the class supports it.
-          # LAMP.pm documentation implies it manages Inner, Middle, Outer.
-          # Loops are usually added via tags or setters.
-          
-          my $lampSignature = LLNL::LAVA::PrimerSet::LAMP->new({
-              "inner_info" => $innerSetInfo,
-              "middle_info" => $middleSetInfo,
-              "outer_info" => $outerSetInfo,
-          });
-          
-          # Add Loop Primers
-          if($includeLoopPrimers) {
-               my $loopF = $f_set_infos->[0]; # LoopF
-               my $loopR = $r_set_infos->[0]; # LoopR
-               
-               $lampSignature->setTag("has_loop_primers", $TRUE);
-               $lampSignature->setTag("floop_info", $loopF);
-               $lampSignature->setTag("bloop_info", $loopR);
-          } else {
-               $lampSignature->setTag("has_loop_primers", $FALSE);
-          }
-          
-          # Add total penalty tag
-          my $f_penalty = $bestForwardPenalties[$i]->[0] + $bestForwardPenalties[$i]->[1];
-          my $r_penalty = $bestReversePenalties[$j]->[0] + $bestReversePenalties[$j]->[1];
-          $lampSignature->setTag("lamp_penalty", $f_penalty + $r_penalty);
-          $lampSignature->setTag("penalty_notes", sprintf("Total F:%.1f R:%.1f | F{%s} | R{%s}", $f_penalty, $r_penalty, $bestForwardPenalties[$i]->[2], $bestReversePenalties[$j]->[2]));
-          
-          push(@{$allFoundSignatures_r}, $lampSignature);
-          $combinedSignatureCount++;
+      }
+      
+      if (scalar(@chunk_retained) > $max_retained_signatures) {
+          @chunk_retained = sort { $a->[2] <=> $b->[2] } @chunk_retained;
+          splice(@chunk_retained, $max_retained_signatures);
+      }
+      
+      if ($verbose_val && defined $verbose_fh) { close($verbose_fh); }
+      
+      $val_pm->finish(0, {
+          chunk_id => $chunk_id,
+          retained => \@chunk_retained,
+          combined_count => $chunk_combined,
+          val_done => $chunk_val_done,
+          val_passed => $chunk_val_passed,
+          val_rejected => $chunk_val_rejected,
+          immediate_rejections => $chunk_immediate,
+          rejected_max_len => $chunk_rejected_max_len,
+          rejected_min_len => $chunk_rejected_min_len,
+          skipped_tm_diff => $skipped_tm_diff,
+          skipped_inner_gap => $skipped_inner_gap
+      });
+  }
+  
+  $val_pm->wait_all_children;
+  
+  my @flat_retained;
+  for(my $c = 0; $c < $num_chunks; $c++) {
+      if (exists $chunk_results_map{$c}) {
+          push @flat_retained, @{$chunk_results_map{$c}};
       }
   }
-  
-  print "Created $combinedSignatureCount complete LAMP signatures.\n";
-  
-  print "Found " .
-    scalar(@{$allFoundSignatures_r}) .
-    " total signatures across all iterations\n";
-
-  # --- VALIDATION STEP (Essential for correct tagging) ---
-  print "Validating and calculating coverage for " . scalar(@{$allFoundSignatures_r}) . " signatures...\n";
-  my $validated_count = 0;
-  foreach my $signature (@{$allFoundSignatures_r}) {
-      # Calculate Intersection and Coverage
-      # Calculer l'intersection des sequences compatibles (PipelineUtils unifie)
-      # Calculate compatible sequence intersection (unified PipelineUtils)
-      my ($amplified_seqs, $coverage, $status) = calculateSignatureIntersection(
-          $signature, 
-          $inputMSA->num_sequences(), 
-          $signatureCommonTargetMinPercent,
-          $includeLoopPrimers,
-          "loop"
-      );
-      $validated_count++;
+  @flat_retained = sort { $a->[2] <=> $b->[2] } @flat_retained;
+  if (scalar(@flat_retained) > $max_retained_signatures) {
+      splice(@flat_retained, $max_retained_signatures);
   }
+  
+  my @retained_signatures;
+  foreach my $rec (@flat_retained) {
+      my ($i, $j, $lamp_penalty, $coverage, $target_count, $inner_span_penalty, $len_penalty) = @$rec;
+      my $innerF = $masterInnerF_r->[$i];
+      my $f_set_infos = $bestForwardInfos[$i];
+      my $innerR = $masterInnerR_r->[$j];
+      my $r_set_infos = $bestReverseInfos[$j];
+      
+      my $innerPair = LLNL::LAVA::PrimerSet::PCRPair->new({ "forward_info" => $innerF, "reverse_info" => $innerR });
+      my $innerSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({ "analyzed_pair" => $innerPair, "penalty" => $innerF->getPenalty() + $innerR->getPenalty() });
+      my $midF = $f_set_infos->[1]; my $midR = $r_set_infos->[1];
+      my $middlePair = LLNL::LAVA::PrimerSet::PCRPair->new({ "forward_info" => $midF, "reverse_info" => $midR });
+      my $middleSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({ "analyzed_pair" => $middlePair, "penalty" => $midF->getPenalty() + $midR->getPenalty() });
+      my $outF = $f_set_infos->[2]; my $outR = $r_set_infos->[2];
+      my $outerPair = LLNL::LAVA::PrimerSet::PCRPair->new({ "forward_info" => $outF, "reverse_info" => $outR });
+      my $outerSetInfo = LLNL::LAVA::PrimerSetInfo::PCRPair->new({ "analyzed_pair" => $outerPair, "penalty" => $outF->getPenalty() + $outR->getPenalty() });
+      
+      my $lampSignature = LLNL::LAVA::PrimerSet::LAMP->new({
+          "inner_info" => $innerSetInfo, "middle_info" => $middleSetInfo, "outer_info" => $outerSetInfo,
+      });
+      if($includeLoopPrimers) {
+           $lampSignature->setTag("has_loop_primers", 1);
+           $lampSignature->setTag("floop_info", $f_set_infos->[0]);
+           $lampSignature->setTag("bloop_info", $r_set_infos->[0]);
+      } else {
+           $lampSignature->setTag("has_loop_primers", 0);
+      }
+      
+      my $f_penalty = $bestForwardPenalties[$i]->[0] + $bestForwardPenalties[$i]->[1];
+      my $r_penalty = $bestReversePenalties[$j]->[0] + $bestReversePenalties[$j]->[1];
+      $lampSignature->setTag("lamp_penalty", $lamp_penalty);
+      $lampSignature->setTag("penalty_notes", sprintf("Spc[I_I:%.1f Len:%.1f] Total F:%.1f R:%.1f | F{%s} | R{%s}", $inner_span_penalty, $len_penalty, $f_penalty, $r_penalty, $bestForwardPenalties[$i]->[2], $bestReversePenalties[$j]->[2]));
+      $lampSignature->setTag("signature_coverage_percent", sprintf("%.2f", $coverage));
+      $lampSignature->setTag("validation_status", "VALIDEE");
+      $lampSignature->setTag("signature_target_count", $target_count);
+      
+      push @retained_signatures, $lampSignature;
+  }
+  
+  my $combinedSignatureCount = $global_combined_count;
+  my $val_passed = $global_val_passed;
+  my $val_rejected = $global_val_rejected;
+  my $val_done = $global_val_done;
+  my $immediate_rejections = $global_immediate_rejections;
+  my $rejected_max_len = $global_rejected_max_len;
+  my $rejected_min_len = $global_rejected_min_len;
+  my $batches_processed = $num_chunks;
+  my $max_rejected_cov = 0; # Dummy
+  my %val_distribution = ("<20%"=>0, "20-40%"=>0, "40-60%"=>0, "60-80%"=>0, ">=80%"=>0); # Dummy
+  my $eviction_occurred = (scalar(@flat_retained) >= $max_retained_signatures) ? 1 : 0;
+  
+  print "\nCreated $combinedSignatureCount LAMP signatures candidates.\n";
+  print "  -> Rejetés pour Tm diff > $maxTmDiff : $global_skipped_tm_diff itérations\n";
+  print "  -> Rejetés pour chevauchement (inner_gap < 0) : $global_skipped_inner_gap itérations\n";
+  
+  if ($verbose_val) {
+      print "Aggregating verbose logs...\n";
+      system("cat ${verbose_base}.*.log.gz > ${verbose_base}.log.gz 2>/dev/null");
+      system("rm -f ${verbose_base}.*.log.gz");
+      print "Verbose log saved to ${verbose_base}.log.gz\n";
+  }
+
+  print "============================================================\n";
+  print "RESUME STATISTIQUE DE L'ASSEMBLAGE ET VALIDATION\n";
+  print "============================================================\n";
+  my $pct_val = $combinedSignatureCount > 0 ? ($val_passed / $combinedSignatureCount * 100) : 0;
+  my $pct_rej = $combinedSignatureCount > 0 ? ($val_rejected / $combinedSignatureCount * 100) : 0;
+  printf("Total candidat crees : %d\n", $combinedSignatureCount);
+  printf("Rejets immediats     : %d (espacement invalide)\n", $immediate_rejections);
+  printf("Rejets (max length)  : %d (> %d nt)\n", $rejected_max_len, $signatureMaxLength);
+  printf("Rejets (min length)  : %d (< %d nt)\n", $rejected_min_len, $signatureMinLength) if $signatureMinLength > 0;
+  printf("Total evalue         : %d (en %d lots)\n", $val_done, $batches_processed);
+  printf("Validees             : %d (%.1f%%)\n", $val_passed, $pct_val);
+  printf("Rejetees (couverture): %d (%.1f%%)\n", $val_rejected, $pct_rej);
+  printf("Seuil requis         : %.1f%%\n", $signatureCommonTargetMinPercent);
+  if ($val_rejected > 0) {
+      my $ecart = $signatureCommonTargetMinPercent - $max_rejected_cov;
+      printf("Couverture MAX (rejetees) : %.2f%% (ecart au seuil : -%.2f%%)\n", $max_rejected_cov, $ecart);
+  }
+  print "Distribution des couvertures :\n";
+  foreach my $bin ("<20%", "20-40%", "40-60%", "60-80%", ">=80%") {
+      printf("  %s : %d\n", $bin, $val_distribution{$bin});
+  }
+  print "------------------------------------------------------------\n";
+  printf("Signatures retenues  : %d\n", scalar(@retained_signatures));
+  if ($eviction_occurred) {
+      printf("ATTENTION: Le plafond de retenue (%d) a ete atteint.\n", $max_retained_signatures);
+      printf("Des candidates valides mais de moindre qualite ont ete evincees.\n");
+  }
+  print "============================================================\n";
+
+  # Mettre a jour la reference globale pour la suite du script
+  $allFoundSignatures_r = \@retained_signatures;
+
   print "Validation complete.\n";
 
 
   my @allSignatures = 
     map {$_->[0]}
-    sort {$a->[1] <=> $b->[1] }
+    sort { $a->[1] <=> $b->[1] || $a->[0]->getStartLocation() <=> $b->[0]->getStartLocation() || $a->[0]->getLength() <=> $b->[0]->getLength() || $a->[0]->getLocationSummary() cmp $b->[0]->getLocationSummary() }
     map {[$_, $_->getTag("lamp_penalty")]}
     @{$allFoundSignatures_r};
 
@@ -2122,10 +2865,25 @@ sub getOligosWithMismatchTolerance {
   # Remplacer la référence globale par la nouvelle liste triée / Replace global reference with sorted list
   $possibleSignatures_r = \@possibleSignatures;
 
+  # RECALCUL des intersections complètes (arrays) UNIQUEMENT pour les signatures survivantes
+  print "Recalculating complete intersections for " . scalar(@possibleSignatures) . " surviving signatures...\n";
+  foreach my $signature (@possibleSignatures) {
+      calculateSignatureIntersection(
+          $signature, 
+          $inputMSA->num_sequences(), 
+          $signatureCommonTargetMinPercent,
+          $includeLoopPrimers,
+          "loop",
+          0,
+          undef,
+          1 # return_list = 1
+      );
+  }
+
   # Analyser les combinaisons de signatures (SUR LES SIGNATURES RÉDUITES ET VALIDÉES)
   if (scalar(@possibleSignatures) > 0) {
     my $num_signatures = scalar(@possibleSignatures);
-    print "\n🔍 Analyse de / Analysis ofs combinaisons sur les $num_signatures signatures finales après réduction...\n";
+    print "\n🔍 Analyse / Analysis of combinaisons sur les $num_signatures signatures finales après réduction...\n";
     
     # Vérifier d'abord si une signature atteint déjà 100% de couverture / First check if a signature already reaches 100% coverage
     my $has_perfect_signature = 0;
@@ -2190,7 +2948,7 @@ sub getOligosWithMismatchTolerance {
       }
       
       close($comb_fh);
-      print "Analyse de / Analysis ofs combinaisons sauvegardée dans: $combinations_file\n\n";
+      print "Analyse / Analysis of combinaisons sauvegardée dans: $combinations_file\n\n";
     }
   }
 
@@ -2404,3 +3162,168 @@ sub getOligosWithMismatchTolerance {
 # Shared utility functions are now in: lib/LLNL/LAVA/PipelineUtils.pm
 # lib/LLNL/LAVA/PipelineUtils.pm
 # Shared utility functions are now in: lib/LLNL/LAVA/PipelineUtils.pm
+
+# --- Branch & Bound Helpers ---
+sub build_rmq {
+    my ($data_r, $col_idx) = @_;
+    my $n = scalar(@$data_r);
+    return [] if $n == 0;
+    my $log_n = int(log($n) / log(2)) + 1;
+    my @st;
+    for my $i (0 .. $n - 1) {
+        $st[$i][0] = $data_r->[$i]->[$col_idx];
+    }
+    for my $j (1 .. $log_n) {
+        my $len = 1 << ($j - 1);
+        for my $i (0 .. $n - 1) {
+            if ($i + $len < $n) {
+                my $a = $st[$i][$j - 1];
+                my $b = $st[$i + $len][$j - 1];
+                $st[$i][$j] = ($a < $b) ? $a : $b;
+            } else {
+                $st[$i][$j] = $st[$i][$j - 1];
+            }
+        }
+    }
+    return \@st;
+}
+
+sub query_rmq {
+    my ($st_r, $L, $R) = @_;
+    return 1000000 if (!defined $st_r || scalar(@$st_r) == 0 || $L > $R || $L < 0);
+    $R = scalar(@$st_r) - 1 if $R >= scalar(@$st_r);
+    my $j = int(log($R - $L + 1) / log(2));
+    my $len = 1 << $j;
+    my $a = $st_r->[$L][$j];
+    my $b = $st_r->[$R - $len + 1][$j];
+    return ($a < $b) ? $a : $b;
+}
+
+sub binary_search_first_ge {
+    my ($data_r, $target_loc) = @_;
+    my $L = 0;
+    my $R = scalar(@$data_r) - 1;
+    my $ans = -1;
+    while ($L <= $R) {
+        my $mid = $L + (($R - $L) >> 1);
+        if ($data_r->[$mid]->[0] >= $target_loc) {
+            $ans = $mid;
+            $R = $mid - 1;
+        } else {
+            $L = $mid + 1;
+        }
+    }
+    return $ans;
+}
+
+sub binary_search_last_le {
+    my ($data_r, $target_loc) = @_;
+    my $L = 0;
+    my $R = scalar(@$data_r) - 1;
+    my $ans = -1;
+    while ($L <= $R) {
+        my $mid = $L + (($R - $L) >> 1);
+        if ($data_r->[$mid]->[0] <= $target_loc) {
+            $ans = $mid;
+            $L = $mid + 1;
+        } else {
+            $R = $mid - 1;
+        }
+    }
+    return $ans;
+}
+
+
+sub print_zero_signature_diagnostic {
+    my ($is_forward, $innerCount, $outerCount, 
+        $rej_geometry, $rej_spacing, $rej_loopgap, 
+        $rej_tm_inner_loop, $rej_tm_loop_middle, $rej_tm_inner_middle, $rej_tm_middle_outer,
+        $min_tm_inner_loop, $min_tm_loop_middle, $min_tm_inner_middle, $min_tm_middle_outer,
+        $min_span_needed, $signatureMaxLength, $maxTmDiff, $opts_r) = @_;
+
+    my $outBase = defined $opts_r->{'output_file'} ? $opts_r->{'output_file'} : "lava_run";
+    my $diagFile = "${outBase}_diagnostic.txt";
+    open(my $dfh, '>', $diagFile) or warn "Cannot open $diagFile\n";
+    
+    my $side = $is_forward ? "Forward" : "Reverse";
+    
+    my $msg = "================================================================================\n";
+    $msg .= "DIAGNOSTIC LAVA : AUCUNE DEMI-SIGNATURE $side TROUVÉE\n";
+    $msg .= "================================================================================\n\n";
+
+    if ($innerCount == 0 || $outerCount == 0) {
+        $msg .= "[CAS 1] PROBLÈME EN AMONT : Pools d'amorces vides.\n";
+        $msg .= "Aucune amorce n'a passé la validation initiale (0 candidat généré).\n";
+        $msg .= "Le problème se situe avant l'assemblage : vos séquences sont probablement trop\n";
+        $msg .= "divergentes dans cette région, ou les contraintes sont trop strictes.\n\n";
+        $msg .= "Pistes de résolution :\n";
+        $msg .= "  - Abaisser --min_primer_coverage (actuel : " . (defined $opts_r->{'min_primer_coverage'} ? $opts_r->{'min_primer_coverage'} : 100) . "%)\n";
+        $msg .= "  - Augmenter --max_total_degenerate_bases (actuel : " . (defined $opts_r->{'max_total_degenerate_bases'} ? $opts_r->{'max_total_degenerate_bases'} : 0) . ")\n";
+        $msg .= "  - Augmenter --max_tolerated_mismatches (actuel : " . (defined $opts_r->{'max_tolerated_mismatches'} ? $opts_r->{'max_tolerated_mismatches'} : 0) . ")\n";
+        $msg .= "  - Élargir la plage de Tm (tm_min, tm_max) des amorces individuelles.\n";
+    } else {
+        $msg .= "[CAS 2] PROBLÈME D'ASSEMBLAGE : Incompatibilité des contraintes.\n";
+        $msg .= "Les pools sont non vides (ex: $innerCount amorces F1c/B1c), mais aucune combinaison\n";
+        $msg .= "ne respecte toutes les contraintes de température et d'espacement.\n\n";
+        
+        my @causes;
+        push @causes, { name => "Thermodynamique (Inner/Loop)", rej => $rej_tm_inner_loop, min => $min_tm_inner_loop, param => "max_tm_diff", type => "tm" } if $rej_tm_inner_loop > 0;
+        push @causes, { name => "Thermodynamique (Loop/Middle)", rej => $rej_tm_loop_middle, min => $min_tm_loop_middle, param => "max_tm_diff", type => "tm" } if $rej_tm_loop_middle > 0;
+        push @causes, { name => "Thermodynamique (Inner/Middle)", rej => $rej_tm_inner_middle, min => $min_tm_inner_middle, param => "max_tm_diff", type => "tm" } if $rej_tm_inner_middle > 0;
+        push @causes, { name => "Thermodynamique (Middle/Outer)", rej => $rej_tm_middle_outer, min => $min_tm_middle_outer, param => "max_tm_diff", type => "tm" } if $rej_tm_middle_outer > 0;
+        
+        push @causes, { name => "Espacement / Géométrie (Trop court)", rej => $rej_spacing, min => $min_span_needed, param => "signature_max_length", type => "span" } if $rej_spacing > 0;
+        push @causes, { name => "Espacement (Loop Gap)", rej => $rej_loopgap, min => 0, param => "loop_min_gap", type => "gap" } if $rej_loopgap > 0;
+        push @causes, { name => "Contraintes Géométriques Générales", rej => $rej_geometry, min => 0, param => "search_range", type => "geom" } if $rej_geometry > 0;
+        
+        @causes = sort { $b->{rej} <=> $a->{rej} } @causes;
+        
+        my $total_rej = $rej_geometry + $rej_spacing + $rej_loopgap + $rej_tm_inner_loop + $rej_tm_loop_middle + $rej_tm_inner_middle + $rej_tm_middle_outer;
+        
+        if (@causes && $total_rej > 0) {
+            my $primary = $causes[0];
+            my $pct = sprintf("%.1f", ($primary->{rej} / $total_rej) * 100);
+            $msg .= "-> Cause principale : $primary->{name} ($pct% des rejets)\n";
+            
+            if ($primary->{type} eq 'tm') {
+                $msg .= "   - Meilleur écart atteignable : " . sprintf("%.2f", $primary->{min}) . " °C.\n";
+                $msg .= "   - Votre limite --max_tm_diff est : " . sprintf("%.2f", $maxTmDiff) . " °C.\n";
+                my $suggest = int($primary->{min} + 1.5);
+                if ($suggest > 10) {
+                    $msg .= "   => SUGGESTION : Les séquences sont très divergentes. Une valeur > 10 °C n'est pas recommandée.\n";
+                    $msg .= "      Envisagez de segmenter la cible ou de relâcher les paramètres d'amont.\n";
+                } else {
+                    $msg .= "   => SUGGESTION : Essayez --max_tm_diff $suggest\n";
+                }
+            } elsif ($primary->{type} eq 'span') {
+                $msg .= "   - Empan minimal nécessaire : $primary->{min} nt.\n";
+                $msg .= "   - Votre --signature_max_length est : $signatureMaxLength nt.\n";
+                my $suggest = $primary->{min} + 20;
+                $msg .= "   => SUGGESTION : Essayez --signature_max_length $suggest\n";
+            } elsif ($primary->{type} eq 'gap') {
+                $msg .= "   - Collision avec le loop_min_gap détectée.\n";
+                $msg .= "   => SUGGESTION : Essayez de réduire --loop_min_gap ou d'augmenter l'espace total.\n";
+            }
+            
+            if (scalar(@causes) > 1) {
+                my $sec = $causes[1];
+                my $pct2 = sprintf("%.1f", ($sec->{rej} / $total_rej) * 100);
+                $msg .= "\n-> Cause secondaire : $sec->{name} ($pct2% des rejets)\n";
+                if ($sec->{type} eq 'tm') {
+                    $msg .= "   - Meilleur écart atteignable : " . sprintf("%.2f", $sec->{min}) . " °C.\n";
+                } elsif ($sec->{type} eq 'span') {
+                    $msg .= "   - Empan minimal nécessaire : $sec->{min} nt.\n";
+                }
+            }
+        }
+    }
+    
+    if ($is_forward) {
+        $msg .= "\nLe scan Reverse n'a pas été exécuté car aucune demi-signature Forward n'a été trouvée.\n";
+    }
+    $msg .= "================================================================================\n";
+    
+    print $msg;
+    print $dfh $msg if $dfh;
+    close($dfh) if $dfh;
+}

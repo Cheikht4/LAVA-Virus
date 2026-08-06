@@ -128,7 +128,8 @@ sub new
     "salt_corrections" => "PRIMER_SALT_CORRECTIONS",
     "thermodynamic_alignment" => "PRIMER_THERMODYNAMIC_ALIGNMENT",
     "thermodynamic_path" => "PRIMER_THERMODYNAMIC_PARAMETERS_PATH",
-    "excluded_regions" => "SEQUENCE_EXCLUDED_REGION",
+    "excluded_regions" => "SEQUENCE_INTERNAL_EXCLUDED_REGION",
+    "included_region" => "INCLUDED_REGION",
   };
 
   # Set of default primer3 targets (primer3 target name => value)
@@ -366,7 +367,7 @@ sub getOligos
       foreach my $reg (@excludedRegions) {
           push(@regionsStrs, $reg->[0] . "," . $reg->[1]);
       }
-      $primer3->add_targets("SEQUENCE_EXCLUDED_REGION" => join(" ", @regionsStrs));
+      $primer3->add_targets("SEQUENCE_INTERNAL_EXCLUDED_REGION" => join(" ", @regionsStrs));
   }
 
   my $primer3Results_r = $primer3->run();
@@ -534,17 +535,14 @@ sub setPrimer3Targets
       next;
     }
     
-    # oops if it doesn't exist
-    if(! exists $p3Names_r->{$currTarget})
-    {
-      confess("programming error - failing to set primer3 target " .
-        "\"$currTarget\" because no default value for that target was " .
-        "created during Primer3Conserved's instantiation");
+    # si le nom de parametre existe dans le mapping, le traduire ; sinon accepter s'il s'agit d'une cle officielle Primer3
+    if (exists $p3Names_r->{$currTarget}) {
+      $p3Targets_r->{$p3Names_r->{$currTarget}} = $paramHash_r->{$currTarget};
+    } elsif (exists $p3Targets_r->{$currTarget} || $currTarget =~ /^(PRIMER_|SEQUENCE_)/) {
+      $p3Targets_r->{$currTarget} = $paramHash_r->{$currTarget};
+    } else {
+      confess("programming error - failing to set primer3 target \"$currTarget\"");
     }
-
-    
-    # Since it does exist, set the correct tag in Targets to be the new value
-    $p3Targets_r->{$p3Names_r->{$currTarget}} = $paramHash_r->{$currTarget};
   }
 }
 
