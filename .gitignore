@@ -24,19 +24,24 @@ logs/
 *Zone.Identifier
 
 # Sorties de tests generees (hors baseline) / Generated test outputs (outside baseline)
+*_per_signature/
+*_signatures_individuelles/
 t/canary_loop
 t/canary_loop.*
 t/canary_loop_amplified*
+t/canary_loop_per_signature/
 t/canary_loop_signatures_individuelles/
 t/canary_loop_run2
 t/canary_loop_run2.*
 t/canary_loop_run2_amplified*
+t/canary_loop_run2_per_signature/
 t/canary_loop_run2_signatures_individuelles/
 t/canary_stem
 t/canary_stem.*
 t/canary_stem_amplified*
 t/canary_stem_combinations.txt
 t/canary_stem_excluded*
+t/canary_stem_per_signature/
 t/canary_stem_signatures_individuelles/
 t/test_form_names.py
 
