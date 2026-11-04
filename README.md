@@ -15,11 +15,11 @@ A web interface is also available at [URL to be completed].
 
 ## System Requirements
 
-The engine relies on the following exact software stack (specified in `environment.yml`):
+The engine relies on the following software stack (specified in `environment.yml` and `Makefile.PL`):
 - **Perl** 5.26.2+
-- **Primer3** 2.6.1
-- **BioPerl** 1.6.924
-- Core Perl modules: `XML::LibXML`, `LWP::Simple`, `YAML`
+- **Primer3** 2.6.1 (or >= 2.5 with embedded thermodynamic parameters)
+- **BioPerl** 1.6.924 (`Bio::SeqIO`, `Bio::AlignIO`, `Bio::SimpleAlign`, `Bio::LocatableSeq`)
+- Core Perl modules: `XML::LibXML`, `Clone` (transitive dependency via `Bio::Root::Root`)
 
 ## Installation
 
@@ -37,32 +37,51 @@ conda activate primer3
 If installing dependencies manually on Linux or macOS:
 ```bash
 # Install system packages (Debian/Ubuntu example)
-sudo apt update && sudo apt install -y perl primer3 libbioperl-perl cpanminus libxml-libxml-perl
+sudo apt update && sudo apt install -y perl primer3 bioperl libxml-libxml-perl libclone-perl
 
 # Or on macOS via Homebrew
 brew install perl primer3 cpanminus
-cpanm BioPerl XML::LibXML
+cpanm BioPerl XML::LibXML Clone
 ```
 
 ## Command-Line Usage
 
-LAVA-Virus provides two main entry scripts:
-1. `lava_stem_primer.pl` - Designs fundamental LAMP stem primer sets (F3/B3 outer primers and FIP/BIP inner primers targeting F1c-F2 and B1c-B2 regions).
-2. `lava_loop_primer.pl` - Designs Loop Forward (FLOOP) and Loop Backward (BLOOP) primers to accelerate amplification for pre-computed stem signatures.
+LAVA-Virus provides two independent LAMP primer design scripts:
+1. `lava_loop_primer.pl` - Designs loop-LAMP primer sets (`F3, B3, FIP [F1c+F2], BIP [B1c+B2], FLOOP, BLOOP`) or classical 6-primer LAMP sets (`--include_loop_primers 0`).
+2. `lava_stem_primer.pl` - Designs stem-LAMP primer sets (`F3, B3, FIP [F1c+F2], BIP [B1c+B2], FSTEM, BSTEM`) or classical 6-primer LAMP sets (`--include_stem_primers 0`).
 
-### Example Workflow
+### Quick Start / Example Workflow
 
-#### 1. Designing Stem Primers
-Run `lava_stem_primer.pl` on a multiple sequence alignment or target sequence file:
+Run the two scripts on the included 40-sequence Rotavirus VP6 alignment (`t/fixtures/rota_canary_40.fasta`) using the XML preset files in `t_data/`:
+
+#### 1. Designing Loop-LAMP Primers (8 primers)
 ```bash
-perl lava_stem_primer.pl --target target_alignment.fasta --output results/stem_out
+perl -Ilib lava_loop_primer.pl --option_file t_data/normal_parameters.xml \
+  --alignment_fasta t/fixtures/rota_canary_40.fasta --output_file /tmp/out_loop.fasta
 ```
 
-#### 2. Designing Loop Primers
-Once valid stem signatures are generated, run `lava_loop_primer.pl` to discover matching loop primers:
+#### 2. Designing Stem-LAMP Primers (8 primers)
 ```bash
-perl lava_loop_primer.pl --target target_alignment.fasta --signatures results/stem_out --output results/loop_out
+perl -Ilib lava_stem_primer.pl --option_file t_data/normal_stem_parameters.xml \
+  --alignment_fasta t/fixtures/rota_canary_40.fasta --output_file /tmp/out_stem.fasta
 ```
+
+#### 3. Designing Classical 6-Primer LAMP Sets (F3, B3, F2, B2, F1, B1)
+```bash
+perl -Ilib lava_loop_primer.pl --option_file t_data/normal_parameters.xml \
+  --alignment_fasta t/fixtures/rota_canary_40.fasta --output_file /tmp/out_classic.fasta \
+  --include_loop_primers 0
+```
+
+### Parameter Presets (`t_data/`)
+
+- **Command-line precedence**: Any option passed on the command line overrides the corresponding tag in `--option_file` (for instance `--alignment_fasta`, `--output_file`, or `--include_loop_primers 0`).
+- **Loop-LAMP preset gradation** on `t/fixtures/rota_canary_40.fasta` (40 sequences):
+  - `t_data/strict_parameters.xml` : **1,121** candidate combinations evaluated -> **1** final signature (`37/40` sequences, `92.50%` coverage, penalty `7.90`).
+  - `t_data/normal_parameters.xml` : **5,418** candidate combinations evaluated -> **1** final signature (`37/40` sequences, `92.50%` coverage, penalty `7.90`).
+  - `t_data/loose_parameters.xml` : **17,333** candidate combinations evaluated -> **1** final signature (`37/40` sequences, `92.50%` coverage, penalty `7.90`).
+  - Classical 6-primer mode (`--option_file t_data/normal_parameters.xml --include_loop_primers 0`): **27,433** candidate combinations evaluated -> **1** final signature (`37/40` sequences, `92.50%` coverage, penalty `3.70`).
+- **Note on `t_data/normal_stem_parameters.xml`**: The test fixture `t/fixtures/rota_canary_40.fasta` offers only **205 exploitable nucleotides**, which is very short for stacking 8 non-overlapping primers (`F3, F2, F1, FSTEM, BSTEM, B1, B2, B3`). Accordingly, `t_data/normal_stem_parameters.xml` uses reduced stem primer lengths (`15/18/22 nt`) tailored to this short test window (**417** candidate combinations evaluated -> **1** final signature, `92.50%` coverage, penalty `7.89`); it serves as an installation-verification starting point rather than a universal production preset.
 
 ## Output Files
 

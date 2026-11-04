@@ -1,4 +1,5 @@
 # Python caches & virtual environments
+Makefile
 __pycache__/
 *.py[cod]
 *$py.class
