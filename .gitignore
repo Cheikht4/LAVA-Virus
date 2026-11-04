@@ -44,6 +44,7 @@ t/canary_stem_combinations.txt
 t/canary_stem_excluded*
 t/canary_stem_per_signature/
 t/canary_stem_signatures_individuelles/
+t/canary_entropy_out*
 t/test_form_names.py
 
 # Re-inclusion prioritaire des baselines (doit rester en derniere position)
